@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # -*- coding: utf-8 -*-
 """
 Created on Wed May 28 10:07:20 2025
@@ -1603,13 +1604,13 @@ plt.show()
 #     kind='average',      # 'average' or 'individual'
 # )
 
-
+# %% shap 各變數解釋
 num_vars = [
-    '平均拜訪間隔天數', '每週平均拜訪客戶數', '業務客戶年齡差距', 
+    '拜訪次數', '拜訪天數差', '每週平均拜訪客戶數', '業務客戶年齡差距', 
     '備註字數', '有意義詞數', 
-    '目前年資',  
-    '上半年準客戶數', '上半年新增保戶數', '冬賽活動參與率', '冬賽FYC', '距離晉升天數', 
-    '件數', '總保費'
+    '目前年資', '業務目前年齡', '加前一賽季增員數', '當年度賽季增員數', 
+    '上半年準客戶數', '上半年新增保戶數', '上年度活動參與率', '上年度FYC', '距離晉升天數', 
+    '被保人目前年齡', '件數', '總保費'
 ]
 
 cat_vars = ['業務客戶性別組合', '最新職級', '拜訪目的']
@@ -1624,7 +1625,7 @@ plt.rc('font', family='Microsoft JhengHei')
 plt.rcParams['axes.unicode_minus'] = False
 
 # 輸出資料夾
-output_dir = "D:/備註文字探勘/shap_trend_plots"
+output_dir = "D:/備註文字探勘/shap_2024"
 os.makedirs(output_dir, exist_ok=True)
 
 # 個別變數解釋
@@ -1753,7 +1754,7 @@ def plot_shap_bin_auto_with_summary(X_data, shap_values, feature_names, variable
             # plt.show()
 
             if output_dir:
-                filename = os.path.join(output_dir, f"{var}_shap_trend_1.png")
+                filename = os.path.join(output_dir, f"{var}_shap_trend.png")
                 plt.savefig(filename, dpi=300, bbox_inches='tight')
                 plt.close()
                 print(f"✅ 已儲存：{filename}")
@@ -1781,7 +1782,7 @@ df_summary = plot_shap_bin_auto_with_summary(
     mean_dict=mean_dict,
     scale_dict=scale_dict,
     window=20,
-    output_dir="D:/備註文字探勘/shap_trend_plots",
+    output_dir="D:/備註文字探勘/shap_2024",
     min_range_width=0.1,
     merge_gap=0.05
 )
@@ -2425,4 +2426,30 @@ print("ROC AUC:", roc_auc_score(truth_group, probas_group))
 #        '最近投保日', '備註字數', '備註行數', '備註文字_處理', '拜訪目的', '預測拜訪目的', '預測拜訪進度', '預測拜訪進度 (%)']]
 # tableau_df.to_excel("D:/備註文字探勘/df_model.xlsx", index=False)
 
+
+=======
+# -*- coding: utf-8 -*-
+"""
+Created on Wed May 28 10:07:20 2025
+
+@author: Z01788
+"""
+
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import (
+    roc_auc_score, roc_curve, precision_recall_curve, classification_report, 
+    average_precision_score, confusion_matrix, ConfusionMatrixDisplay
+)
+
+from xgboost import XGBClassifier
+from scipy.sparse import hstack, csr_matrix
+import matplotlib.pyplot as plt
+plt.rc('font', family = 'Microsoft JhengHei')
+plt.rcParams['axes.unicode_minus'] = False 
 

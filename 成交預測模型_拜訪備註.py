@@ -1,7 +1,3 @@
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
->>>>>>> 3489e83 (add existing file)
 # -*- coding: utf-8 -*-
 """
 Created on Wed May 28 10:07:20 2025
@@ -81,6 +77,22 @@ def extract_non_sharp_text(note):
     return '\n'.join(clean_lines)
 
 df['拜訪備註_文字'] = df['拜訪備註'].apply(extract_non_sharp_text)
+
+# 計算每位業代對每個客戶的拜訪次數
+df['拜訪次數'] = (
+    df.groupby(['業代', '客戶UUID'])['拜訪紀錄UUID']
+    .transform('count')
+)
+
+# 計算每位業代對所有客戶的平均拜訪次數
+df['平均每客戶拜訪次數'] = (
+    df.groupby('業代')['拜訪次數']
+    .transform('mean')
+)
+# df['平均每客戶拜訪次數'].describe().T
+
+le = LabelEncoder()
+df['營業單位_編碼'] = le.fit_transform(df['營業單位'])
 
 # %% CKIP 斷詞
 # change python version to <3.12.x to run tensorflow
@@ -372,13 +384,10 @@ df['是否晉升'] = df['晉升日期_dt'].apply(lambda x: 1 if pd.notna(x) else
 # 3 計算距離晉升天數（可為負數）
 df['距離晉升天數'] = (df['晉升日期_dt'] - df['拜訪時間']).dt.days
 
-
-
 df['是否晉升'] = df.apply(
     lambda row: 1 if pd.notna(row['晉升日期_dt']) and 0 <= (row['晉升日期_dt'] - row['拜訪時間']).days  else 0,
     axis=1
 )
-
 
 # %%%% 納入增員資料
 member = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", sheet_name="MEMBER", dtype={'業代': str})
@@ -428,13 +437,6 @@ customer = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", shee
 customer['建立時間'] = pd.to_datetime(customer['建立時間'])
 # 篩選 2024/1/1 ~ 2024/7/31 的筆數
 customer_filtered = customer[(customer['建立時間'] >= '2023-07-01') & (customer['建立時間'] <= '2023-12-31')]
-# # 計算每個業代的客戶數（依不同 UUID 計算）
-# customer_counts = customer_filtered.groupby('業代')['客戶UUID'].nunique().reset_index()
-
-# customer_counts = customer_counts.rename(columns={'客戶UUID': '上半年新客數'})
-
-# df = df.merge(customer_counts, on='業代', how='left')
-# df['上半年新客數'] = df['上半年新客數'].fillna(0).astype(int)
 
 # 建立分類欄位：「準客戶」與「新增保戶」
 def classify_customer_type(ctype):
@@ -475,9 +477,8 @@ df = df.merge(customer_stats, on='業代', how='left')
 df[['上半年準客戶數', '上半年新增保戶數']] = df[['上半年準客戶數', '上半年新增保戶數']].fillna(0).astype(int)
 
 # %%%% 納入客戶資料
-customer = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", sheet_name="INFO")
-
-customer_summary = customer.groupby('經紀人1-被保人CRM UUID').agg({
+info = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", sheet_name="INFO")
+customer_summary = info.groupby('經紀人1-被保人CRM UUID').agg({
     '被保人性別': 'last', 
     '被保人目前年齡': 'last', 
     '要保人目前年齡': 'last', 
@@ -542,11 +543,6 @@ def get_nearest_policy_info(uuid, visit_time):
     # 回傳：天數差、最近投保日、是否為網路投保
     return pd.Series([(visit_time - r['投保日']).days, r['投保日'], r['是否為網路投保']])
 
-# 套用：新增「拜訪與最近投保日天數差」、「最近投保日」
-# df_valid_notes[['拜訪與投保日天數差', '最近投保日']] = df_valid_notes.apply(
-#     lambda row: get_nearest_policy_diff(row['客戶UUID'], row['拜訪時間']),
-#     axis=1
-# )
 df_valid_notes[['拜訪與投保日天數差', '最近投保日', '最近是否為網路投保']] = df_valid_notes.apply(
     lambda row: get_nearest_policy_info(row['客戶UUID'], row['拜訪時間']),
     axis=1
@@ -625,14 +621,6 @@ policy_by_agent = policy_by_agent.rename(columns={'經紀人業代': '業代', '
 
 # 5. 合併回原始 df_valid_notes
 df_valid_notes = df_valid_notes.merge(policy_by_agent, on='業代', how='left')
-
-# def compute_gender_diff(row):
-#     if row['業務性別'] == row['被保人性別']:
-#         return row['業務性別']  # 0 or 1
-#     else:
-#         return 2  # 性別不同
-
-# df_valid_notes['業務客戶性別差'] = df_valid_notes.apply(compute_gender_diff, axis=1)
 
 def compute_gender_diff_v2(row):
     if row['業務性別'] == row['被保人性別']:
@@ -948,8 +936,6 @@ plt.show()
 # %%%% 數值型特徵重要性評估
 import shap
 import xgboost as xgb
-import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
 
 # 只使用數值型特徵（X_num）
 X = X_num  # 或 X_num_scaled
@@ -989,28 +975,21 @@ for i, class_name in enumerate(category_order):
     plt.show()
 
 # %% 成交機率預測
-import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler
-from sklearn.feature_extraction.text import TfidfVectorizer
 from gensim.models import Word2Vec
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.metrics import roc_auc_score, average_precision_score, classification_report
-from xgboost import XGBClassifier
 
 # ===== Step 1: 建立成交標籤 =====
-df_model_1 = df_insurence_1.copy()
+df_model_1 = df_insurence_1[df_insurence_1['平均每客戶拜訪次數'] > 4]
 df_model_1['是否成交'] = df_model_1['拜訪與投保日天數差'].apply(lambda x: 1 if pd.notna(x) and x <= 30 else 0)
 y = df_model_1['是否成交']
 
 # ===== Step 2: 數值特徵處理 =====
 numerical_cols = [
-    '拜訪次數', '拜訪天數差', '每週平均拜訪客戶數', '業務客戶年齡差距', 
+    '業務客戶性別組合', '最新職級', '拜訪目的', 
+    '平均拜訪間隔天數', '每週平均拜訪客戶數', '業務客戶年齡差距', # '拜訪紀錄密度', 
     '備註字數', '有意義詞數', 
-    '目前年資', '業務目前年齡', '加前一賽季增員數', '當年度賽季增員數', 
-    '上半年準客戶數', '上半年新增保戶數', '上年度活動參與率', '上年度FYC', '距離晉升天數', 
-    '被保人目前年齡', '件數', '總保費', 
-    '業務客戶性別組合', '最新職級', '拜訪目的'
+    '目前年資', '營業單位_編碼', # '當年度賽季增員數', '加前一賽季增員數', '最新職級', 
+    '上半年準客戶數', '今年度活動參與率', '上年度FYC', '距離晉升天數', 
+    '件數', '總保費' # '業務客戶性別組合', 
 ]
 # '拜訪次數', '拜訪天數差', '備註行數', '業務性別', '被保人性別', '最近是否為網路投保', 'CEO', '夏賽活動參與率', '夏賽FYC', 
 # '是否晉升', '得獎數', '夏賽增員數', '冬賽增員數', '業務目前年齡', '被保人目前年齡', '今年度活動參與率', '今年度FYC', 
@@ -1367,7 +1346,7 @@ for group in ['低頻', '中頻', '高頻']:
 # pd.qcut(df_model_1['業代客戶拜訪頻率'], q=3).unique() 
 
 from sklearn.metrics import (
-    roc_curve, precision_recall_curve, roc_auc_score, average_precision_score,
+    roc_auc_score, average_precision_score,
     f1_score, accuracy_score, precision_score, recall_score
 )
 
@@ -1416,7 +1395,7 @@ for group in groups:
 
         model.fit(X_train, y_train)
         y_proba = model.predict_proba(X_test)[:, 1]
-        y_pred = (y_proba >= threshold).astype(int)
+        y_pred = (y_proba >= 0.6).astype(int)
 
         all_y_true.extend(y_test)
         all_y_proba.extend(y_proba)
@@ -1596,38 +1575,16 @@ plt.grid(True)
 plt.show()
 
 
-
-# from sklearn.inspection import PartialDependenceDisplay
-# PartialDependenceDisplay.from_estimator(model_simple, X, ['每週平均拜訪客戶數'])
-# PartialDependenceDisplay.from_estimator(
-#     estimator=model_simple,
-#     X=X_num,  # 特徵資料（DataFrame）
-#     features=['拜訪天數差'],  # 或 [('拜訪天數差', '總保費')] for 2D PDP
-#     grid_resolution=50,  # 控制 X 軸刻度數量
-#     kind='average',      # 'average' or 'individual'
-# )
-
-<<<<<<< HEAD
 # %% shap 各變數解釋
 num_vars = [
-    '拜訪次數', '拜訪天數差', '每週平均拜訪客戶數', '業務客戶年齡差距', 
+    '平均拜訪間隔天數', '每週平均拜訪客戶數', '業務客戶年齡差距', # '拜訪紀錄密度', 
     '備註字數', '有意義詞數', 
-    '目前年資', '業務目前年齡', '加前一賽季增員數', '當年度賽季增員數', 
-    '上半年準客戶數', '上半年新增保戶數', '上年度活動參與率', '上年度FYC', '距離晉升天數', 
-    '被保人目前年齡', '件數', '總保費'
-=======
-
-num_vars = [
-    '平均拜訪間隔天數', '每週平均拜訪客戶數', '業務客戶年齡差距', 
-    '備註字數', '有意義詞數', 
-    '目前年資',  
-    '上半年準客戶數', '上半年新增保戶數', '冬賽活動參與率', '冬賽FYC', '距離晉升天數', 
+    '目前年資', # '當年度賽季增員數', 
+    '上半年準客戶數', '今年度活動參與率', '上年度FYC', '距離晉升天數', 
     '件數', '總保費'
->>>>>>> 3489e83 (add existing file)
 ]
 
-cat_vars = ['業務客戶性別組合', '最新職級', '拜訪目的']
-
+cat_vars = ['業務客戶性別組合', '最新職級', '拜訪目的', '營業單位_編碼']
 
 
 import os
@@ -1638,11 +1595,7 @@ plt.rc('font', family='Microsoft JhengHei')
 plt.rcParams['axes.unicode_minus'] = False
 
 # 輸出資料夾
-<<<<<<< HEAD
 output_dir = "D:/備註文字探勘/shap_2024"
-=======
-output_dir = "D:/備註文字探勘/shap_trend_plots"
->>>>>>> 3489e83 (add existing file)
 os.makedirs(output_dir, exist_ok=True)
 
 # 個別變數解釋
@@ -1771,11 +1724,7 @@ def plot_shap_bin_auto_with_summary(X_data, shap_values, feature_names, variable
             # plt.show()
 
             if output_dir:
-<<<<<<< HEAD
                 filename = os.path.join(output_dir, f"{var}_shap_trend.png")
-=======
-                filename = os.path.join(output_dir, f"{var}_shap_trend_1.png")
->>>>>>> 3489e83 (add existing file)
                 plt.savefig(filename, dpi=300, bbox_inches='tight')
                 plt.close()
                 print(f"✅ 已儲存：{filename}")
@@ -1803,11 +1752,7 @@ df_summary = plot_shap_bin_auto_with_summary(
     mean_dict=mean_dict,
     scale_dict=scale_dict,
     window=20,
-<<<<<<< HEAD
     output_dir="D:/備註文字探勘/shap_2024",
-=======
-    output_dir="D:/備註文字探勘/shap_trend_plots",
->>>>>>> 3489e83 (add existing file)
     min_range_width=0.1,
     merge_gap=0.05
 )
@@ -2054,7 +1999,7 @@ plt.title("每位客戶平均拜訪次數 vs 是否成交")
 # %% 檢查共線性
 import pandas as pd
 from statsmodels.stats.outliers_influence import variance_inflation_factor
-from statsmodels.tools.tools import add_constant
+# from statsmodels.tools.tools import add_constant
 import seaborn as sns
 import matplotlib.pyplot as plt
 
@@ -2129,10 +2074,6 @@ def plot_distribution_by_label(df, feature_list, target_col='是否成交', bins
 plot_distribution_by_label(df_model_1, numerical_cols)
 
 # 針對實際成交自動找切點 (長條圖)
-import pandas as pd
-import matplotlib.pyplot as plt
-from sklearn.tree import DecisionTreeClassifier
-
 def analyze_feature_vs_conversion(df, feature, target='是否成交', bins=5, min_samples_leaf=100):
     df_valid = df[[feature, target]].dropna()
 
@@ -2202,8 +2143,6 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.feature_extraction.text import TfidfVectorizer
 from xgboost import XGBClassifier
 from scipy.sparse import hstack, csr_matrix
-import numpy as np
-import pandas as pd
 
 # ===== 1. 資料與參數設定 =====
 text_col = '備註文字_處理'
@@ -2450,34 +2389,3 @@ print("ROC AUC:", roc_auc_score(truth_group, probas_group))
 #        '是否有備註(排除#)', '含有#', '拜訪備註_文字', '標籤名稱', '拜訪備註_詞語', '詞數', '拜訪與投保日天數差', 
 #        '最近投保日', '備註字數', '備註行數', '備註文字_處理', '拜訪目的', '預測拜訪目的', '預測拜訪進度', '預測拜訪進度 (%)']]
 # tableau_df.to_excel("D:/備註文字探勘/df_model.xlsx", index=False)
-
-
-<<<<<<< HEAD
-=======
-# -*- coding: utf-8 -*-
-"""
-Created on Wed May 28 10:07:20 2025
-
-@author: Z01788
-"""
-
-import pandas as pd
-import numpy as np
-from collections import defaultdict
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import LabelEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.model_selection import StratifiedKFold
-from sklearn.metrics import (
-    roc_auc_score, roc_curve, precision_recall_curve, classification_report, 
-    average_precision_score, confusion_matrix, ConfusionMatrixDisplay
-)
-
-from xgboost import XGBClassifier
-from scipy.sparse import hstack, csr_matrix
-import matplotlib.pyplot as plt
-plt.rc('font', family = 'Microsoft JhengHei')
-plt.rcParams['axes.unicode_minus'] = False 
-
-=======
->>>>>>> 3489e83 (add existing file)

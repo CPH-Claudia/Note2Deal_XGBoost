@@ -1615,11 +1615,6 @@ num_vars = [
 
 cat_vars = ['業務客戶性別組合', '最新職級', '拜訪目的', '營業單位_編碼']
 
-
-import os
-import pandas as pd
-import matplotlib.pyplot as plt
-
 plt.rc('font', family='Microsoft JhengHei')
 plt.rcParams['axes.unicode_minus'] = False
 
@@ -1689,14 +1684,15 @@ def plot_shap_bin_auto_with_summary_dual_x(
             # 繪圖開始
             fig, ax1 = plt.subplots(figsize=(8, 4))
 
-            peak_idx = df["SHAP_smooth"].idxmax()
-            peak_x = df.loc[peak_idx, "值"]
-            peak_raw = peak_x * scale + mean
+            # peak_idx = df["SHAP_smooth"].idxmax()
+            # peak_x = df.loc[peak_idx, "值"]
+            # peak_raw = peak_x * scale + mean
 
             ax1.scatter(df["值"], df["SHAP"], alpha=0.3, label="原始 SHAP")
             ax1.plot(df["值"], df["SHAP_smooth"], color='blue', label="平滑趨勢")
             ax1.axhline(0, color='gray', linestyle='--')
-            ax1.axvline(peak_x, color='red', linestyle='--', label=f'最大貢獻點 = {peak_raw:.2f}')
+            # ax1.axvline(peak_x, color='red', linestyle='--', 
+            #             label=f'最大貢獻點 = {peak_raw:,.2f}')  # ⭐ 貨幣格式)
 
             for idx, ((lo, hi), (lo_raw, hi_raw)) in enumerate(zip(merged_ranges, restored_ranges)):
                 ax1.axvspan(lo, hi, color='lightgreen', alpha=0.3)
@@ -1711,7 +1707,7 @@ def plot_shap_bin_auto_with_summary_dual_x(
             # 設定主 X 軸（標準化值）標籤在上方
             ax1.xaxis.set_label_position('top')
             ax1.xaxis.tick_top()
-            ax1.set_xlabel(f"標準化", labelpad=10)
+            ax1.set_xlabel("標準化", labelpad=10)
             ax1.set_ylabel("SHAP 值")
             ax1.set_title(f"{var} 對成交的 SHAP 趨勢")
             
@@ -1721,26 +1717,25 @@ def plot_shap_bin_auto_with_summary_dual_x(
             
             # 替代 ax2 = ax1.twiny()
             secax = ax1.secondary_xaxis('bottom', functions=(to_raw, to_std))
-            secax.set_xlabel(f"原始數值")
+            secax.set_xlabel("原始數值")
             
             # 平均與標準差說明
-            mean_text = f"原始平均值: {mean:.2f}\n原始標準差: {scale:.2f}"
+            mean_text = f"原始平均值: {mean:,.2f}\n原始標準差: {scale:,.2f}"  # ⭐ 貨幣格式
             ax1.text(0.98, 0.95, mean_text, transform=ax1.transAxes,
                      ha='right', va='top', fontsize=8, color='dimgray',
                      bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.5))
 
             ax1.legend(loc='upper left')
             ax1.grid(True)
-
-            # if output_dir:
-            #     filename = os.path.join(output_dir, f"{var}_shap_trend.png")
-            #     plt.savefig(filename, dpi=300, bbox_inches='tight')
-            #     plt.close()
-            #     print(f"✅ 已儲存：{filename}")
-            # else:
-            #     plt.tight_layout()
-            plt.show()
-
+            
+            if output_dir:
+                filename = os.path.join(output_dir, f"{var}_shap_plot2.png")
+                plt.savefig(filename, dpi=300, bbox_inches='tight')
+                plt.close()
+                print(f"✅ 已儲存：{filename}")
+            else:
+                plt.tight_layout()
+            
         except Exception as e:
             print(f"❌ {var} 失敗：{e}")
 

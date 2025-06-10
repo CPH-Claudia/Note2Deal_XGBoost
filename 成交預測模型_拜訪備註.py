@@ -7,6 +7,9 @@ Created on Wed May 28 10:07:20 2025
 
 import pandas as pd
 import numpy as np
+import random
+import os
+
 from collections import defaultdict
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -975,6 +978,8 @@ for i, class_name in enumerate(category_order):
     plt.show()
 
 # %% 成交機率預測
+random.seed(42)
+np.random.seed(42)
 from gensim.models import Word2Vec
 
 # ===== Step 1: 建立成交標籤 =====
@@ -1005,7 +1010,15 @@ sentences = df_model_1['備註文字_處理']
 w2v_model = Word2Vec(sentences=sentences, vector_size=100, window=5, min_count=2)
 
 # TF-IDF 權重
-tfidf_vectorizer = TfidfVectorizer(tokenizer=lambda x: x, preprocessor=lambda x: x, token_pattern=None)
+# tfidf_vectorizer = TfidfVectorizer(tokenizer=lambda x: x, preprocessor=lambda x: x, token_pattern=None)
+def identity(x):
+    return x
+
+tfidf_vectorizer = TfidfVectorizer(
+    tokenizer=identity,
+    preprocessor=identity,
+    token_pattern=None
+)
 tfidf_vectorizer.fit(sentences)
 tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
 
@@ -1041,6 +1054,10 @@ final_feature_names = w2v_top_feature_names + numerical_cols
 # ===== Step 6: Hold-out 測試切分 + 特徵篩選 =====
 X_trainval, X_test, y_trainval, y_test = train_test_split(
     X_combined, y, test_size=0.2, stratify=y, random_state=42)
+
+# 轉為 DataFrame
+X_trainval_df = pd.DataFrame(X_trainval, columns=final_feature_names)
+X_trainval_df.to_csv("D:/備註文字探勘/models/train_reference.csv", index=False)
 
 model_init = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
 model_init.fit(X_trainval, y_trainval)
@@ -1133,12 +1150,24 @@ def classify_probability(p):
 
 combined_df['預測潛力分群'] = combined_df['預測機率'].apply(classify_probability)
 
-# # === 寫入 Excel，不同工作表 ===
+# %% 寫入 Excel，不同工作表
 # with pd.ExcelWriter("D:/備註文字探勘/成交預測_結果.xlsx", engine='xlsxwriter') as writer:
 #     proba_df.to_excel(writer, sheet_name='交叉驗證結果', index=False)
 #     test_result_df.to_excel(writer, sheet_name='測試集結果', index=False)
 #     combined_df.to_excel(writer, sheet_name='合併結果', index=False)
 
+# 儲存模型
+with open('D:/備註文字探勘/models/xgb_model_final.pkl', 'wb') as f:
+    pickle.dump(final_model, f)
+
+with open('D:/備註文字探勘/models/word2vec_model.pkl', 'wb') as f:
+    pickle.dump(w2v_model, f)
+import dill
+with open('D:/備註文字探勘/models/tfidf_vectorizer.pkl', 'wb') as f:
+    dill.dump(tfidf_vectorizer, f)
+
+with open('D:/備註文字探勘/models/scaler.pkl', 'wb') as f:
+    pickle.dump(StandardScaler().fit(X_num), f)
 
 
 # # Odds Ratio
@@ -1599,42 +1628,20 @@ output_dir = "D:/備註文字探勘/shap_2024"
 os.makedirs(output_dir, exist_ok=True)
 
 # 個別變數解釋
-explainer = shap.Explainer(final_model, X_trainval, feature_names=final_feature_names)
+explainer = shap.Explainer(final_model, 
+                           X_trainval, 
+                           feature_names=final_feature_names, 
+                           model_output='raw', 
+                           feature_perturbation="interventional") # 減少隨機性
+
 shap_values = explainer(X_trainval)
 
-import os
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-def plot_shap_bin_auto_with_summary(X_data, shap_values, feature_names, variables,
-                                    mean_dict, scale_dict,
-                                    window=20, output_dir=None,
-                                    min_range_width=0.1, merge_gap=0.05):
-    """
-    Parameters
-    ----------
-    X_data : np.ndarray
-        特徵矩陣（標準化後）
-    shap_values : shap.Explanation
-        對應的 SHAP 值
-    feature_names : list of str
-        特徵名稱
-    variables : list of str
-        要分析的變數（數值型）
-    mean_dict : dict
-        每個變數對應的原始平均值（還原用）
-    scale_dict : dict
-        每個變數對應的原始標準差（還原用）
-    window : int
-        平滑滾動視窗大小
-    output_dir : str
-        圖檔輸出路徑
-    min_range_width : float
-        最小區段寬度（過短視為雜訊）
-    merge_gap : float
-        相鄰區段距離小於此值則合併（避免破碎）
-    """
+def plot_shap_bin_auto_with_summary_dual_x(
+    X_data, shap_values, feature_names, variables,
+    mean_dict, scale_dict,
+    window=20, output_dir=None,
+    min_range_width=0.1, merge_gap=0.05
+):
     summary_list = []
 
     for var in variables:
@@ -1646,31 +1653,24 @@ def plot_shap_bin_auto_with_summary(X_data, shap_values, feature_names, variable
             df = pd.DataFrame({"值": x, "SHAP": shap_val}).sort_values("值").reset_index(drop=True)
             df["SHAP_smooth"] = df["SHAP"].rolling(window=window, min_periods=1).mean()
 
-            # 找 SHAP_smooth < 0 的連續區段
             df["is_neg"] = (df["SHAP_smooth"] < 0).astype(int)
             df["neg_group"] = (df["is_neg"].diff(1) != 0).cumsum()
             neg_segments = df[df["is_neg"] == 1].groupby("neg_group")
-
             neg_ranges = [(seg["值"].min(), seg["值"].max()) for _, seg in neg_segments]
 
-            # 推算正向區段
-            value_min = df["值"].min()
-            value_max = df["值"].max()
+            value_min, value_max = df["值"].min(), df["值"].max()
             positive_ranges = []
             current_start = value_min
-
             for neg_start, neg_end in sorted(neg_ranges):
                 if current_start < neg_start:
                     positive_ranges.append((current_start, neg_start))
                 current_start = max(current_start, neg_end)
-
             if current_start < value_max:
                 positive_ranges.append((current_start, value_max))
 
-            # 過濾過短區段
             positive_ranges = [(lo, hi) for lo, hi in positive_ranges if (hi - lo) >= min_range_width]
 
-            # 合併過於接近的區段
+            # 合併破碎段
             merged_ranges = []
             for lo, hi in sorted(positive_ranges):
                 if not merged_ranges:
@@ -1678,31 +1678,28 @@ def plot_shap_bin_auto_with_summary(X_data, shap_values, feature_names, variable
                 else:
                     prev_lo, prev_hi = merged_ranges[-1]
                     if lo - prev_hi <= merge_gap:
-                        merged_ranges[-1][1] = hi  # 合併
+                        merged_ranges[-1][1] = hi
                     else:
                         merged_ranges.append([lo, hi])
 
-            # 還原為原始值
-            mean = mean_dict[var]
-            scale = scale_dict[var]
+            # 還原原始數值
+            mean, scale = mean_dict[var], scale_dict[var]
             restored_ranges = [(lo * scale + mean, hi * scale + mean) for lo, hi in merged_ranges]
 
-            # 畫圖
+            # 繪圖開始
+            fig, ax1 = plt.subplots(figsize=(8, 4))
+
             peak_idx = df["SHAP_smooth"].idxmax()
             peak_x = df.loc[peak_idx, "值"]
             peak_raw = peak_x * scale + mean
 
-            plt.figure(figsize=(8, 4))
-            plt.scatter(df["值"], df["SHAP"], alpha=0.2, label="原始 SHAP")
-            plt.plot(df["值"], df["SHAP_smooth"], color='blue', label="平滑趨勢")
-            plt.axhline(0, color='gray', linestyle='--')
-            plt.axvline(peak_x, color='red', linestyle='--', label=f'最大貢獻點 = {peak_raw:.2f}')
+            ax1.scatter(df["值"], df["SHAP"], alpha=0.3, label="原始 SHAP")
+            ax1.plot(df["值"], df["SHAP_smooth"], color='blue', label="平滑趨勢")
+            ax1.axhline(0, color='gray', linestyle='--')
+            ax1.axvline(peak_x, color='red', linestyle='--', label=f'最大貢獻點 = {peak_raw:.2f}')
 
-            for (lo, hi), (lo_raw, hi_raw) in zip(merged_ranges, restored_ranges):
-                plt.axvspan(lo, hi, color='lightgreen', alpha=0.3)
-                plt.text((lo + hi)/2, 0.05, f'{lo_raw:.2f}–{hi_raw:.2f}',
-                         ha='center', va='bottom', fontsize=8, color='green')
-
+            for idx, ((lo, hi), (lo_raw, hi_raw)) in enumerate(zip(merged_ranges, restored_ranges)):
+                ax1.axvspan(lo, hi, color='lightgreen', alpha=0.3)
                 summary_list.append({
                     '變數': var,
                     '原始值區間_起': round(lo_raw, 2),
@@ -1711,40 +1708,51 @@ def plot_shap_bin_auto_with_summary(X_data, shap_values, feature_names, variable
                     '標準化值_迄': round(hi, 2)
                 })
 
-            plt.xlabel(f"{var} (標準化)")
-            plt.ylabel("SHAP 值")
-            plt.title(f"{var} 對成交的 SHAP 趨勢")
-            # 顯示平均與標準差
+            # 設定主 X 軸（標準化值）標籤在上方
+            ax1.xaxis.set_label_position('top')
+            ax1.xaxis.tick_top()
+            ax1.set_xlabel(f"標準化", labelpad=10)
+            ax1.set_ylabel("SHAP 值")
+            ax1.set_title(f"{var} 對成交的 SHAP 趨勢")
+            
+            # 雙 X 軸：下方顯示原始數值，對齊標準化 X 軸
+            def to_raw(x): return x * scale + mean
+            def to_std(x): return (x - mean) / scale
+            
+            # 替代 ax2 = ax1.twiny()
+            secax = ax1.secondary_xaxis('bottom', functions=(to_raw, to_std))
+            secax.set_xlabel(f"原始數值")
+            
+            # 平均與標準差說明
             mean_text = f"原始平均值: {mean:.2f}\n原始標準差: {scale:.2f}"
-            plt.text(0.98, 0.95, mean_text, transform=plt.gca().transAxes,
-                     ha='right', va='top', fontsize=9, color='dimgray',
+            ax1.text(0.98, 0.95, mean_text, transform=ax1.transAxes,
+                     ha='right', va='top', fontsize=8, color='dimgray',
                      bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.5))
-            plt.legend()
-            plt.grid(True)
-            # plt.show()
 
-            if output_dir:
-                filename = os.path.join(output_dir, f"{var}_shap_trend.png")
-                plt.savefig(filename, dpi=300, bbox_inches='tight')
-                plt.close()
-                print(f"✅ 已儲存：{filename}")
-            else:
-                plt.show()
+            ax1.legend(loc='upper left')
+            ax1.grid(True)
+
+            # if output_dir:
+            #     filename = os.path.join(output_dir, f"{var}_shap_trend.png")
+            #     plt.savefig(filename, dpi=300, bbox_inches='tight')
+            #     plt.close()
+            #     print(f"✅ 已儲存：{filename}")
+            # else:
+            #     plt.tight_layout()
+            plt.show()
 
         except Exception as e:
             print(f"❌ {var} 失敗：{e}")
 
     return pd.DataFrame(summary_list)
 
-# 建立還原字典
 scaler = StandardScaler()
 X_num_scaled = scaler.fit_transform(X_num)  # <== 這是你原本做的
 
 mean_dict = dict(zip(numerical_cols, scaler.mean_))
 scale_dict = dict(zip(numerical_cols, scaler.scale_))
 
-# 執行繪圖 + 區間整理
-df_summary = plot_shap_bin_auto_with_summary(
+df_summary = plot_shap_bin_auto_with_summary_dual_x(
     X_data=X_trainval,
     shap_values=shap_values,
     feature_names=final_feature_names,

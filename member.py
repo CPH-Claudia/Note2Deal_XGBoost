@@ -123,7 +123,45 @@ df2['距離晉升天數'] = (df2['晉升日期_dt'] - df2['拜訪時間 年/月/
 
 # customer
 customer = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="customer") 
+customer['生日 年/月/日'] = pd.to_datetime(customer['生日 年/月/日'])
 
+# 建立分類欄位：「準客戶」與「新增保戶」
+def classify_customer_type(ctype):
+    if pd.isna(ctype):
+        return '未知'
+    elif '準客戶' in ctype:
+        return '準客戶'
+    elif '錠嵂保戶' in ctype:
+        return '新增保戶'
+    else:
+        return '其他'
+
+customer['分類'] = customer['客戶類型'].apply(classify_customer_type)
+
+# 計算每個業代在上半年新增的準客戶數與新增保戶數（以客戶UUID唯一計算）
+customer_stats = (
+    customer
+    .groupby(['業代', '分類'])['客戶UUID']
+    .nunique()
+    .unstack(fill_value=0)
+    .reset_index()
+)
+
+# 確保兩欄都有，即使其中之一為 0 也存在
+if '準客戶' not in customer_stats.columns:
+    customer_stats['準客戶'] = 0
+if '新增保戶' not in customer_stats.columns:
+    customer_stats['新增保戶'] = 0
+
+# 欄位重新命名
+customer_stats = customer_stats.rename(columns={
+    '準客戶': '上半年準客戶數',
+    '新增保戶': '上半年新增保戶數'
+})
+
+# 合併到原始 df
+df = df.merge(customer_stats, on='業代', how='left')
+df[['上半年準客戶數', '上半年新增保戶數']] = df[['上半年準客戶數', '上半年新增保戶數']].fillna(0).astype(int)
 
 
 

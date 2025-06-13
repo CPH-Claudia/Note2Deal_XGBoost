@@ -284,5 +284,8 @@ df_filtered = df_cleaned[
 
 df_filtered_1 = df_filtered[df_filtered['平均每客戶拜訪次數'] > 4]
 
-
+invalid_visits = df4[
+    (df4['客戶是否為業務'] == 1) &
+    (df4['對應業務簽約日'] < df4['拜訪時間 年/月/日'])
+]
 

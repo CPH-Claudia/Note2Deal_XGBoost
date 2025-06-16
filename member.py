@@ -122,6 +122,11 @@ df2['是否晉升'] = df2['晉升日期_dt'].apply(lambda x: 1 if pd.notna(x) el
 # 計算距離晉升天數（可為負數）
 df2['距離晉升天數'] = (df2['晉升日期_dt'] - df2['拜訪時間 年/月/日']).dt.days
 
+df2['業務生日'] = pd.to_datetime(df2['業務生日'], format='%Y%m%d', errors='coerce')  
+
+# 計算簽約當下年齡（以年為單位，向下取整）
+df2['簽約時年齡'] = ((df2['簽約日 年/月/日'] - df2['業務生日']).dt.days // 365).astype(int)
+
 # customer
 customer = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="customer", dtype={"職業類別代碼": str}) 
 
@@ -212,6 +217,18 @@ agent_keys = set(df4['業務姓名生日key'].dropna())
 # 判斷客戶是否成為業務：看客戶key是否出現在業務key集合中
 df4['客戶是否為業務'] = df4['客戶姓名生日key'].isin(agent_keys).astype(int)
 
+
+summary_1 = (
+    df4.groupby('客戶是否為業務')
+    .agg(
+        人數=('業代', 'nunique'),
+        平均簽約年齡=('簽約時年齡', 'mean'),
+        中位數簽約年齡=('簽約時年齡', 'median'),
+        平均簽約年限=('簽約日 年/月/日', lambda s: ((pd.Timestamp('today') - s).dt.days/365).mean())
+    )
+    .reset_index()
+)
+
 # 建立業務 key → 簽約日對照表（如一位業務有多筆，只取最早）
 agent_sign_dates = (
     df4[['業務姓名生日key', '簽約日 年/月/日']]
@@ -276,10 +293,9 @@ missing_report = df_cleaned.isna().sum()
 missing_report = missing_report[missing_report > 0].sort_values(ascending=False)
 
 
-# 篩選 2024/2/1 ~ 2024/6/30 和 2024/8/1 ~ 2024/12/31 的筆數
+# 篩選 2024/1/1 ~ 2024/12/31 的筆數
 df_filtered = df_cleaned[
-    ((df_drop['拜訪時間 年/月/日'] >= pd.Timestamp('2024-02-01')) & (df_drop['拜訪時間 年/月/日'] <= pd.Timestamp('2024-06-30'))) |
-    ((df_drop['拜訪時間 年/月/日'] >= pd.Timestamp('2024-08-01')) & (df_drop['拜訪時間 年/月/日'] <= pd.Timestamp('2024-12-31')))
+    ((df_drop['拜訪時間 年/月/日'] >= pd.Timestamp('2024-01-01')) & (df_drop['拜訪時間 年/月/日'] <= pd.Timestamp('2024-12-31')))
 ]
 
 df_filtered_1 = df_filtered[df_filtered['平均每客戶拜訪次數'] > 4]
@@ -289,3 +305,153 @@ invalid_visits = df4[
     (df4['對應業務簽約日'] < df4['拜訪時間 年/月/日'])
 ]
 
+# %% 斷詞
+import pandas as pd
+from ckiptagger import WS
+import os, pickle
+from opencc import OpenCC
+import requests
+
+from ckiptagger import data_utils
+data_utils.download_data_gdown("./")
+
+def extract_and_segment_notes(df, note_column='拜訪備註', ckip_model_path='./CKIP'):
+    # 初始化 CKIP 斷詞工具
+    ws = WS(ckip_model_path)
+
+    # 自定保險術語字典（可擴充）
+    insurance_terms = set([
+        "保單健診", "華南產", "癌症險", "旅平險", "新安東京", "還本型保單", "富邦", "安達", "續保", 
+        "富邦產", "定期壽險", "重大傷病", "實支實付", "住院醫療", "理賠", "分紅躉繳", "轉介紹", 
+        "保單","保險","行銷活動","防疫險","保險經紀人","健診","籃子理論","錠嵂","意外險","資產規劃", "車險需求",
+        "儲蓄險","中壽","中國人壽","旅平","旅平險","三商美邦","簽約","成交","重大傷病","失能險","保經","見面三講","開門三講","退休規劃", 
+        "車險","醫療險","火險","壽險","新光","遠雄","富邦","Toyota","機車險","寵物險","自動化工程師","六大保障","建議書", 
+        "台灣人壽","失智症","app","OPP","保險存摺","國泰","遠雄","照會","三照","遞送","簽約","市調表","解約","美元保單","美元儲蓄", 
+        "送保單" ,"照會單" ,"台壽","保誠" ,"癌症" ,"不動產","問卷","理賠","健診","轉介","簽收","建立關係","強制險","永達", 
+        "觀念溝通","需求分析","六大保障","保單健診","終身","萬事利達","續保","友邦","寒暄","關心","保險存摺","年金","PHB","宏泰", 
+        "南山","長照","XHB","HNRC","新生兒","約訪","年繳","美金","phb","探班","要保人",'企管副會長','意外險需求','double鑫','下週'
+    ])
+
+    # 1. 清洗備註文字
+    def clean_text(note):
+        if pd.isna(note): return ''
+        lines = str(note).replace('_x000D_', '\n').replace('\r', '').splitlines()
+        return '\n'.join([
+            line.strip() for line in lines
+            if line.strip() and not (line.startswith('#') or line.startswith('＃'))
+        ])
+
+    df = df.copy()
+    df['備註_清理'] = df[note_column].apply(clean_text)
+    text_list = df['備註_清理'].tolist()
+
+    # 2. CKIP 斷詞
+    ws_result = ws(text_list)
+
+    # 3. 合併保險術語
+    def merge_custom_terms(ws_result, term_set):
+        max_len = max(len(term) for term in term_set)
+        merged = []
+        for sent in ws_result:
+            i, merged_sent = 0, []
+            while i < len(sent):
+                match = None
+                for l in range(min(max_len, len(sent) - i), 0, -1):
+                    phrase = ''.join(sent[i:i+l])
+                    if phrase in term_set:
+                        match = phrase
+                        i += l
+                        break
+                if match:
+                    merged_sent.append(match)
+                else:
+                    merged_sent.append(sent[i])
+                    i += 1
+            merged.append(merged_sent)
+        return merged
+
+    word_list = merge_custom_terms(ws_result, insurance_terms)
+
+    # 4. 載入繁體停用詞
+    stopword_urls = [
+        "https://raw.githubusercontent.com/goto456/stopwords/master/baidu_stopwords.txt",
+        "https://raw.githubusercontent.com/goto456/stopwords/master/cn_stopwords.txt",
+        "https://raw.githubusercontent.com/goto456/stopwords/master/hit_stopwords.txt",
+        "https://raw.githubusercontent.com/goto456/stopwords/master/scu_stopwords.txt"
+    ]
+    cc = OpenCC('s2t')
+    stopwords_trad = set()
+    for url in stopword_urls:
+        try:
+            r = requests.get(url)
+            r.encoding = 'utf-8'
+            if r.status_code == 200:
+                for line in r.text.strip().splitlines():
+                    word = cc.convert(line.strip())
+                    if word: stopwords_trad.add(word)
+        except:
+            print(f"⚠️ 停用詞載入失敗: {url}")
+
+    # 5. 去除停用詞與過短詞
+    filtered_words = [
+        [w for w in sent if w not in stopwords_trad and len(w) > 1]
+        for sent in word_list
+    ]
+
+    # 回存處理結果
+    df['斷詞結果'] = filtered_words
+    return df
+
+df4 = extract_and_segment_notes(df4, note_column='拜訪備註', ckip_model_path='./CKIP')
+
+
+# %% Model 
+
+
+
+# %% 新進業務員過去是否已經是錠嵂保戶
+agent2 = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="agent2") 
+# 確保兩欄都是 datetime 格式
+agent2['簽約日 年/月/日'] = pd.to_datetime(agent2['簽約日 年/月/日'], errors='coerce')
+agent2['生日'] = pd.to_datetime(agent2['生日'], format='%Y%m%d', errors='coerce')  
+
+# 計算簽約當下年齡（以年為單位，向下取整）
+agent2['簽約時年齡'] = ((agent2['簽約日 年/月/日'] - agent2['生日']).dt.days // 365).astype(int)
+
+policy2 = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="policy2") 
+policy2['被保人生日 年/月/日'] = pd.to_datetime(policy2['被保人生日 年/月/日'], format='%Y%m%d', errors='coerce')
+
+# 1. 建立比對 key
+agent2['姓名生日key'] = agent2['業務員'].astype(str) + '_' + agent2['生日'].astype(str)
+policy2['姓名生日key'] = policy2['被保人'].astype(str) + '_' + policy2['被保人生日 年/月/日'].astype(str)
+
+# 2. 建立：客戶 -> 最早交易日的查詢表
+policy_key_date = policy2.set_index('姓名生日key')['最小值 投保日'].to_dict()
+
+# 3. 判斷每位業務在簽約前是否為客戶（flag 為 1 表示有，0 表示無）
+def is_existing_customer(row):
+    key = row['姓名生日key']
+    trade_date = policy_key_date.get(key)
+    if pd.notnull(trade_date) and trade_date < row['簽約日 年/月/日']:
+        return 1
+    return 0
+
+agent2['成為業務前是否為保戶'] = agent2.apply(is_existing_customer, axis=1)
+
+# 5. 統計
+summary = (
+    agent2.groupby('成為業務前是否為保戶')
+    .agg(
+        人數=('業代', 'nunique'),
+        平均簽約年齡=('簽約時年齡', 'mean'),
+        中位數簽約年齡=('簽約時年齡', 'median'),
+        平均簽約年限=('簽約日 年/月/日', lambda s: ((pd.Timestamp('today') - s).dt.days/365).mean())
+    )
+    .reset_index()
+)
+
+# 6. 占比
+total = agent2['業代'].nunique()
+summary['占比'] = summary['人數'] / total
+
+print(summary)

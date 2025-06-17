@@ -4,7 +4,7 @@ Created on Wed Jun 11 10:48:44 2025
 
 @author: Z01788
 """
-
+# %% combine 
 import pandas as pd
 
 # visit
@@ -267,78 +267,41 @@ def gender_diff(row):
 
 df4['業務客戶性別組合'] = df4.apply(gender_diff, axis=1)
 
-
-
-# 缺失值處理
-df_drop = df4.dropna(subset=['客戶性別', '客戶目前年齡', '業務目前年齡'])
-
-keep_cols = [
-    '營業單位', '營業單位代碼', '業代', '客戶UUID', '拜訪紀錄UUID', '拜訪時間 年/月/日', '拜訪備註',
-    '拜訪次數', '平均每客戶拜訪次數', '(增)拜訪目的', '方式', '業務員', '簽約日 年/月/日', '最新職級',
-    '業務目前年齡', '業務性別', '業務生日', '目前年資', '晉升日', '距離晉升天數', '歷年新增業務數',
-    '歷年準增數', '客戶姓名', '性別', '生日 年/月/日', '客戶類型', '受理件數', '繳款保費new',
-    '客戶生日', '客戶是否為業務', '是否有效拜訪', '客戶業務年齡差距', '業務客戶性別組合'
-]
-
-df_cleaned = df_drop[keep_cols].copy()
-
-df_cleaned[['距離晉升天數', '受理件數', '繳款保費new']] = df_cleaned[[
-    '距離晉升天數', '受理件數', '繳款保費new']].fillna(0)
-# df_drop[['對應業務簽約日', '合終日期 年/月/日', '晉升日期_dt', '拜訪備註', 
-#      '客戶姓名', '客戶姓名生日key', ]] = df_drop[[
-#          '對應業務簽約日', '合終日期 年/月/日', '晉升日期_dt', '拜訪備註', 
-#           '客戶姓名', '客戶姓名生日key', '客戶類型']].fillna(pd.NaT)
-
-missing_report = df_cleaned.isna().sum()
-missing_report = missing_report[missing_report > 0].sort_values(ascending=False)
-
-
-# 篩選 2024/1/1 ~ 2024/12/31 的筆數
-df_filtered = df_cleaned[
-    ((df_drop['拜訪時間 年/月/日'] >= pd.Timestamp('2024-01-01')) & (df_drop['拜訪時間 年/月/日'] <= pd.Timestamp('2024-12-31')))
-]
-
-df_filtered_1 = df_filtered[df_filtered['平均每客戶拜訪次數'] > 4]
-
-invalid_visits = df4[
-    (df4['客戶是否為業務'] == 1) &
-    (df4['對應業務簽約日'] < df4['拜訪時間 年/月/日'])
-]
-
-# %% 斷詞
+# %% ckip
 import pandas as pd
 from ckiptagger import WS
 import os, pickle
 from opencc import OpenCC
 import requests
 
-from ckiptagger import data_utils
-data_utils.download_data_gdown("./")
+import tensorflow as tf
+# from ckiptagger import data_utils
+# data_utils.download_data_gdown("./")
 
-def extract_and_segment_notes(df, note_column='拜訪備註', ckip_model_path='./CKIP'):
+def extract_and_segment_notes(df, note_column='拜訪備註', ckip_model_path='./data'):
     # 初始化 CKIP 斷詞工具
     ws = WS(ckip_model_path)
 
     # 自定保險術語字典（可擴充）
     insurance_terms = set([
         "保單健診", "華南產", "癌症險", "旅平險", "新安東京", "還本型保單", "富邦", "安達", "續保", 
-        "富邦產", "定期壽險", "重大傷病", "實支實付", "住院醫療", "理賠", "分紅躉繳", "轉介紹", 
-        "保單","保險","行銷活動","防疫險","保險經紀人","健診","籃子理論","錠嵂","意外險","資產規劃", "車險需求",
-        "儲蓄險","中壽","中國人壽","旅平","旅平險","三商美邦","簽約","成交","重大傷病","失能險","保經","見面三講","開門三講","退休規劃", 
+        "富邦產", "定期壽險", "重大傷病", "實支實付", "住院醫療", "理賠", "分紅躉繳", "轉介紹", "增援", "增員", 
+        "保單","保險","行銷活動","防疫險","保險經紀人","健診","籃子理論","錠嵂","意外險","資產規劃", "車險需求", 
+        "儲蓄險","中壽","中國人壽","旅平","旅平險","三商美邦","成交","重大傷病","失能險","保經","見面三講","開門三講","退休規劃", 
         "車險","醫療險","火險","壽險","新光","遠雄","富邦","Toyota","機車險","寵物險","自動化工程師","六大保障","建議書", 
         "台灣人壽","失智症","app","OPP","保險存摺","國泰","遠雄","照會","三照","遞送","簽約","市調表","解約","美元保單","美元儲蓄", 
         "送保單" ,"照會單" ,"台壽","保誠" ,"癌症" ,"不動產","問卷","理賠","健診","轉介","簽收","建立關係","強制險","永達", 
-        "觀念溝通","需求分析","六大保障","保單健診","終身","萬事利達","續保","友邦","寒暄","關心","保險存摺","年金","PHB","宏泰", 
+        "觀念溝通","需求分析","保單健診","終身","萬事利達","續保","友邦","寒暄","關心","保險存摺","年金","PHB","宏泰", 
         "南山","長照","XHB","HNRC","新生兒","約訪","年繳","美金","phb","探班","要保人",'企管副會長','意外險需求','double鑫','下週'
     ])
 
     # 1. 清洗備註文字
     def clean_text(note):
         if pd.isna(note): return ''
-        lines = str(note).replace('_x000D_', '\n').replace('\r', '').splitlines()
-        return '\n'.join([
-            line.strip() for line in lines
-            if line.strip() and not (line.startswith('#') or line.startswith('＃'))
+        note = str(note).replace('_x000D_', '').replace('\r', '').replace('\n', ' ')  # ✅ 核心修正
+        return ' '.join([
+            line.strip() for line in note.splitlines()
+            if line.strip() and not line.strip().startswith(('＃', '#'))
         ])
 
     df = df.copy()
@@ -402,14 +365,342 @@ def extract_and_segment_notes(df, note_column='拜訪備註', ckip_model_path='.
     df['斷詞結果'] = filtered_words
     return df
 
-df4 = extract_and_segment_notes(df4, note_column='拜訪備註', ckip_model_path='./CKIP')
+df4 = extract_and_segment_notes(df4, note_column='拜訪備註', ckip_model_path='./data')
+
+# %% 有意義的詞數
+from gensim.models import Word2Vec
+
+def extract_recruit_features_from_tokenlist(df,
+                                            tokenlist_column='斷詞結果',
+                                            rawtext_column='備註_清理',
+                                            min_sim_score=0.6,
+                                            model_vector_size=150):
+    """
+    df: 包含斷詞欄位（list 格式）與原始備註欄位（str）
+    tokenlist_column: 斷詞欄位，格式為 list
+    rawtext_column: 原始清理後備註欄位，用來計算字數
+    """
+
+    # === Step 1: 增員種子詞 ===
+    recruit_seed_words = [
+        "增員", "轉職", "推薦", "創業", "副業", "面談", "面試", "事業", "邀約", "詢問工作",
+        "邀請工作", "主動詢問", "邀請面談", "說明工作", "對工作有興趣", "適合這份工作", 
+        "尋找工作", "問工作內容", "時間彈性", "自由收入", "職涯", "事業規劃", "邀請加入"
+    ]
+
+    # === Step 2: Word2Vec 訓練 ===
+    token_lists = df[tokenlist_column].dropna().tolist()
+    model = Word2Vec(sentences=token_lists, vector_size=model_vector_size, window=5, min_count=2, workers=4)
+
+    # === Step 3: 擴充語意詞集合 ===
+    recruit_words_set = set(recruit_seed_words)
+    for word in recruit_seed_words:
+        if word in model.wv:
+            for sim_word, score in model.wv.most_similar(word, topn=20):
+                if score >= min_sim_score:
+                    recruit_words_set.add(sim_word)
+
+    print(f"📌 擴充後的語意詞數量：{len(recruit_words_set)}")
+
+    # === Step 4: 計算三項特徵 ===
+    def count_recruit_words(tokens):
+        if not isinstance(tokens, list): return 0
+        return sum(1 for word in tokens if word in recruit_words_set)
+
+    df = df.copy()
+    df['詞數'] = df[tokenlist_column].apply(lambda x: len(x) if isinstance(x, list) else 0)
+    df['增員語意詞數'] = df[tokenlist_column].apply(count_recruit_words)
+    df['recruit_ratio'] = df.apply(
+        lambda row: row['增員語意詞數'] / row['詞數'] if row['詞數'] > 0 else 0, axis=1
+    )
+
+    # === Step 5: 原始備註字數計算（不含空白與換行）
+    def count_characters(text):
+        if pd.isna(text): return 0
+        return len(str(text).replace('\n', '').replace(' ', '').replace('\r', ''))
+
+    df['備註字數'] = df[rawtext_column].apply(count_characters)
+
+    return df, recruit_words_set
+
+df_new, recruit_words = extract_recruit_features_from_tokenlist(df4)
+
+# %% filter 
+# 缺失值處理
+df_drop = df_new.dropna(subset=['客戶性別', '客戶目前年齡', '業務目前年齡'])
+
+keep_cols = [
+    '營業單位', '營業單位代碼', '業代', '客戶UUID', '拜訪紀錄UUID', '拜訪時間 年/月/日', '拜訪備註',
+    '拜訪次數', '平均每客戶拜訪次數', '(增)拜訪目的', '方式', '業務員', '簽約日 年/月/日', '最新職級',
+    '業務目前年齡', '業務性別', '業務生日', '目前年資', '晉升日', '距離晉升天數', '歷年新增業務數',
+    '歷年準增數', '客戶姓名', '性別', '生日 年/月/日', '客戶類型', '受理件數', '繳款保費new',
+    '客戶生日', '客戶是否為業務', '是否有效拜訪', '客戶業務年齡差距', '業務客戶性別組合', 
+    '斷詞結果', '增員語意詞數', '備註字數'
+]
+
+df_cleaned = df_drop[keep_cols].copy()
+
+df_cleaned[['距離晉升天數', '受理件數', '繳款保費new']] = df_cleaned[[
+    '距離晉升天數', '受理件數', '繳款保費new']].fillna(0)
+# df_drop[['對應業務簽約日', '合終日期 年/月/日', '晉升日期_dt', '拜訪備註', 
+#      '客戶姓名', '客戶姓名生日key', ]] = df_drop[[
+#          '對應業務簽約日', '合終日期 年/月/日', '晉升日期_dt', '拜訪備註', 
+#           '客戶姓名', '客戶姓名生日key', '客戶類型']].fillna(pd.NaT)
+
+missing_report = df_cleaned.isna().sum()
+missing_report = missing_report[missing_report > 0].sort_values(ascending=False)
 
 
-# %% Model 
+# 篩選 2024/1/1 ~ 2024/12/31 的筆數
+df_filtered = df_cleaned[
+    ((df_drop['拜訪時間 年/月/日'] >= pd.Timestamp('2024-01-01')) & (df_drop['拜訪時間 年/月/日'] <= pd.Timestamp('2024-12-31')))
+]
+
+df_filtered_1 = df_filtered[df_filtered['平均每客戶拜訪次數'] > 4]
+
+invalid_visits = df_new[
+    (df_new['客戶是否為業務'] == 1) &
+    (df_new['對應業務簽約日'] < df_new['拜訪時間 年/月/日'])
+]
+
+unit_stats = df_filtered_1.groupby('營業單位').agg(
+    業務員數=('業代', 'nunique'),
+    客戶數=('客戶UUID', 'nunique'),
+    拜訪次數=('拜訪紀錄UUID', 'nunique')
+).reset_index()
+
+# %% model-xgboost
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
+from xgboost import XGBClassifier
+
+# ===== 1. 篩選與建立成交標籤 =====
+# df_model_1 = df_filtered_1[df_filtered_1['平均每客戶拜訪次數'] > 4].copy()
+# df_model_1['是否成交'] = df_model_1['是否有效拜訪']  # 或改為你要的成交定義
+
+y = df_filtered_1['是否有效拜訪']
+
+# ===== 2. 數值特徵欄位 =====
+numerical_cols = [
+    '業務客戶性別組合', '最新職級', '平均每客戶拜訪次數', '目前年資', 
+    '距離晉升天數', '備註字數', '增員語意詞數', '受理件數', '繳款保費new',
+    '業務目前年齡', '客戶業務年齡差距'
+]
+
+X_num = df_filtered_1[numerical_cols].fillna(0)
+X_num_scaled = StandardScaler().fit_transform(X_num)
+
+# ===== 3. 建立 Word2Vec 模型與 TF-IDF 加權 =====
+sentences = df_filtered_1['斷詞結果'].dropna().tolist()
+w2v_model = Word2Vec(sentences=sentences, vector_size=100, window=5, min_count=2)
+
+# 建立 TF-IDF 權重字典
+def identity(x): return x
+tfidf = TfidfVectorizer(tokenizer=identity, preprocessor=identity, token_pattern=None)
+tfidf.fit(sentences)
+tfidf_dict = dict(zip(tfidf.get_feature_names_out(), tfidf.idf_))
+
+# 加權平均詞向量
+def vectorize_sentence_weighted(sentence):
+    vecs, weights = [], []
+    for word in sentence:
+        if word in w2v_model.wv and word in tfidf_dict:
+            vecs.append(w2v_model.wv[word] * tfidf_dict[word])
+            weights.append(tfidf_dict[word])
+    return np.sum(vecs, axis=0) / np.sum(weights) if vecs else np.zeros(w2v_model.vector_size)
+
+X_w2v_weighted = np.array([vectorize_sentence_weighted(s) for s in df_filtered_1['斷詞結果']])
+X_combined = np.hstack([X_w2v_weighted, X_num_scaled])
+
+# ===== 4. 資料切分與模型建構 =====
+X_trainval, X_test, y_trainval, y_test = train_test_split(
+    X_combined, y, test_size=0.2, stratify=y, random_state=42
+)
+
+# 交叉驗證
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+roc_scores, pr_scores = [], []
+all_y_true, all_y_pred, all_y_proba = [], [], []
+
+for train_idx, val_idx in skf.split(X_trainval, y_trainval):
+    X_train, X_val = X_trainval[train_idx], X_trainval[val_idx]
+    y_train, y_val = y_trainval.iloc[train_idx], y_trainval.iloc[val_idx]
+
+    model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+    model.fit(X_train, y_train)
+
+    y_proba = model.predict_proba(X_val)[:, 1]
+    y_pred = (y_proba >= 0.6).astype(int)
+
+    roc_scores.append(roc_auc_score(y_val, y_proba))
+    pr_scores.append(average_precision_score(y_val, y_proba))
+    all_y_true.extend(y_val)
+    all_y_pred.extend(y_pred)
+    all_y_proba.extend(y_proba)
+
+print("\n📊 Cross-Validation (Train Set)")
+print(classification_report(all_y_true, all_y_pred))
+print(f"Average ROC AUC: {np.mean(roc_scores):.4f}")
+print(f"Average PR AUC : {np.mean(pr_scores):.4f}")
+
+# ===== 5. Hold-out 測試集評估 =====
+final_model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+final_model.fit(X_trainval, y_trainval)
+
+y_test_proba = final_model.predict_proba(X_test)[:, 1]
+y_test_pred = (y_test_proba >= 0.6).astype(int)
+
+print("\n🧪 Final Evaluation on Hold-out Test Set")
+print(classification_report(y_test, y_test_pred))
+print(f"ROC AUC: {roc_auc_score(y_test, y_test_proba):.4f}")
+print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
+
+
+# %% model-lstm 
+import numpy as np
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+from sklearn.utils.class_weight import compute_class_weight
+
+def prepare_lstm_data(df, time_steps=5, embedding_dim=100):
+    from gensim.models import Word2Vec
+
+    token_lists = df['斷詞結果'].dropna().tolist()
+    w2v_model = Word2Vec(sentences=token_lists, vector_size=embedding_dim, window=3, min_count=1, workers=4)
+
+    def sentence_to_vec(sentence):
+        vectors = [w2v_model.wv[word] for word in sentence if word in w2v_model.wv]
+        return np.mean(vectors, axis=0) if vectors else np.zeros(embedding_dim)
+
+    df_sorted = df.sort_values('拜訪時間 年/月/日')
+    X_data, y_data, uuid_list = [], [], []
+
+    grouped = df_sorted.groupby('客戶UUID')
+
+    for uid, group in grouped:
+        vec_seq = [sentence_to_vec(row['斷詞結果']) for _, row in group.iterrows()]
+        if len(vec_seq) < time_steps:
+            # 前面補零
+            pad_len = time_steps - len(vec_seq)
+            vec_seq = [np.zeros(embedding_dim)] * pad_len + vec_seq
+        else:
+            vec_seq = vec_seq[-time_steps:]  # 只取最後 time_steps 筆
+
+        X_data.append(vec_seq)
+        y_data.append(group['是否有效拜訪'].iloc[0])
+        uuid_list.append(uid)
+
+    return np.array(X_data, dtype='float32'), np.array(y_data, dtype='int32'), uuid_list, w2v_model
+
+
+# === 載入資料 ===
+X_lstm, y_lstm, uuids, w2v_model = prepare_lstm_data(df_filtered_1, time_steps=5, embedding_dim=100)
+
+# === 建立模型（固定 input_shape，避開 symbolic tensor）===
+model = Sequential([
+    LSTM(64, input_shape=(5, 100)),
+    Dropout(0.3),
+    Dense(32, activation='relu'),
+    Dense(1, activation='sigmoid')
+])
+
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# === class_weight 計算 ===
+classes = np.unique(y_lstm)
+weights = compute_class_weight('balanced', classes=classes, y=y_lstm)
+class_weight_dict = {int(c): w for c, w in zip(classes, weights)}
+
+# === 訓練 ===
+model.fit(
+    X_lstm, y_lstm,
+    epochs=20,
+    batch_size=32,
+    validation_split=0.2,
+    class_weight=class_weight_dict
+)
 
 
 
-# %% 新進業務員過去是否已經是錠嵂保戶
+
+
+import numpy as np
+import pandas as pd
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+
+# 假設 df 為你的拜訪資料（每筆為一個備註）
+# 必備欄位：'客戶UUID', '拜訪時間', '斷詞結果'（list 格式）
+
+def prepare_lstm_data(df, time_steps=5, embedding_dim=100):
+    # 訓練 Word2Vec
+    token_lists = df['斷詞結果'].dropna().tolist()
+    w2v_model = Word2Vec(sentences=token_lists, vector_size=embedding_dim, window=3, min_count=1, workers=4, seed=42)
+
+    # 每段備註 → 詞向量平均
+    def sentence_to_vec(sentence):
+        vectors = [w2v_model.wv[word] for word in sentence if word in w2v_model.wv]
+        return np.mean(vectors, axis=0).astype('float32') if vectors else np.zeros(embedding_dim, dtype='float32')
+
+    X_data, y_data, uuid_list = [], [], []
+    grouped = df.sort_values('拜訪時間 年/月/日').groupby('客戶UUID')
+
+    for uid, group in grouped:
+        seq = [sentence_to_vec(row['斷詞結果']) for _, row in group.iterrows()]
+        padded_seq = pad_sequences([seq], maxlen=time_steps, dtype='float32', padding='pre', truncating='pre')[0]
+        X_data.append(padded_seq)
+        y_data.append(group['是否有效拜訪'].iloc[0]) 
+        uuid_list.append(uid)
+
+    return np.array(X_data), np.array(y_data), uuid_list, w2v_model
+
+
+X_lstm, y_lstm, uuids, w2v_model = prepare_lstm_data(df_filtered_1, time_steps=5, embedding_dim=100)
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense, Dropout
+
+X_lstm = np.array(X_lstm)
+y_lstm = np.array(y_lstm)
+
+# 確保 input_shape 為 tuple of integers（非 tensor）
+input_shape = tuple(map(int, X_lstm.shape[1:])) 
+model = Sequential([
+    LSTM(64, input_shape=input_shape),
+    Dropout(0.3),
+    Dense(32, activation='relu'),
+    Dense(1, activation='sigmoid')
+])
+
+# # Over Sampling
+# from imblearn.over_sampling import SMOTE
+# sm = SMOTE(random_state=42)
+# X_res, y_res = sm.fit_resample(X_train, y_train)
+
+from sklearn.utils.class_weight import compute_class_weight
+
+
+
+model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+
+# 確保 y_lstm 為 numpy array 且類別為 0/1
+classes = np.unique(y_lstm)
+weights = compute_class_weight('balanced', classes=classes, y=y_lstm)
+class_weight_dict = {int(c): w for c, w in zip(classes, weights)}
+
+# model.fit(X_lstm, y_lstm, epochs=10, batch_size=16, validation_split=0.2)
+model.fit(X_lstm, y_lstm, 
+          epochs=20, 
+          batch_size=32, 
+          validation_split=0.2, 
+          class_weight=class_weight_dict)
+
+# %% 新進業務員是否為保戶
+# 篩選簽約日在 2020/1/1 ~ 2024/12/31 之間的新進業務
 agent2 = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="agent2") 
 # 確保兩欄都是 datetime 格式
 agent2['簽約日 年/月/日'] = pd.to_datetime(agent2['簽約日 年/月/日'], errors='coerce')
@@ -455,3 +746,29 @@ total = agent2['業代'].nunique()
 summary['占比'] = summary['人數'] / total
 
 print(summary)
+
+# 近五年新進業務員
+mask = (agent2['簽約日 年/月/日'] >= '2020-01-01') & (agent2['簽約日 年/月/日'] <= '2024-12-31')
+agent2_filtered = agent2[mask].copy()
+
+
+# 重新統計僅針對 2020~2024 的新進業務
+summary = (
+    agent2_filtered.groupby('成為業務前是否為保戶')
+    .agg(
+        人數=('業代', 'nunique'),
+        平均簽約年齡=('簽約時年齡', 'mean'),
+        中位數簽約年齡=('簽約時年齡', 'median'),
+        平均簽約年限=('簽約日 年/月/日', lambda s: ((pd.Timestamp('today') - s).dt.days / 365).mean())
+    )
+    .reset_index()
+)
+
+# 計算占比
+total = agent2_filtered['業代'].nunique()
+summary['占比'] = summary['人數'] / total
+
+print(summary)
+
+
+

@@ -383,9 +383,10 @@ def extract_recruit_features_from_tokenlist(df,
 
     # === Step 1: 增員種子詞 ===
     recruit_seed_words = [
-        "增員", "轉職", "推薦", "創業", "副業", "面談", "面試", "事業", "邀約", "詢問工作",
-        "邀請工作", "主動詢問", "邀請面談", "說明工作", "對工作有興趣", "適合這份工作", 
-        "尋找工作", "問工作內容", "時間彈性", "自由收入", "職涯", "事業規劃", "邀請加入"
+        "增員", "轉職", "推薦", "創業", "副業", "面談", "面試", "事業", "邀約", "詢問",
+        "邀請工作", "主動", "邀請面談", "說明工作", "對工作有興趣", "適合這份工作", 
+        "尋找工作", "問工作內容", "時間彈性", "自由收入", "職涯", "事業規劃", "邀請加入", 
+        "簽約", "報名", "新人", "計畫", "考照班", "考照", "證照", "尖兵", "報名"
     ]
 
     # === Step 2: Word2Vec 訓練 ===
@@ -562,21 +563,47 @@ print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
 
 # %% model-lstm 
 import numpy as np
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+# from tensorflow.keras.preprocessing.sequence import pad_sequences
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from sklearn.utils.class_weight import compute_class_weight
 
 def prepare_lstm_data(df, time_steps=5, embedding_dim=100):
     from gensim.models import Word2Vec
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    
+    # 1. 將斷詞結果變為字串以供 TfidfVectorizer 使用
+    df = df.copy()
+    df['斷詞字串'] = df['斷詞結果'].apply(lambda x: ' '.join(x) if isinstance(x, list) else '')
 
+
+    # 2. 訓練 TF-IDF 向量器
+    tfidf = TfidfVectorizer()
+    tfidf_matrix = tfidf.fit_transform(df['斷詞字串'])  # ✅ 必須先 fit 才能用 idf_
+    idf_dict = dict(zip(tfidf.get_feature_names_out(), tfidf.idf_))  # ✅ 正確取得詞權重
+
+    # 3. 訓練 Word2Vec
     token_lists = df['斷詞結果'].dropna().tolist()
     w2v_model = Word2Vec(sentences=token_lists, vector_size=embedding_dim, window=3, min_count=1, workers=4)
 
+    # 4. 加權平均詞向量（僅取前 10 高權重詞）
     def sentence_to_vec(sentence):
-        vectors = [w2v_model.wv[word] for word in sentence if word in w2v_model.wv]
-        return np.mean(vectors, axis=0) if vectors else np.zeros(embedding_dim)
+        tokens = [word for word in sentence if word in w2v_model.wv and word in idf_dict]
+        sorted_tokens = sorted(tokens, key=lambda w: idf_dict[w], reverse=True)[:10]
+        weighted_vectors = []
+        weights = []
 
+        for word in sorted_tokens:
+            weight = idf_dict[word]
+            weighted_vectors.append(w2v_model.wv[word] * weight)
+            weights.append(weight)
+
+        if weighted_vectors:
+            return np.sum(weighted_vectors, axis=0) / np.sum(weights)
+        else:
+            return np.zeros(embedding_dim)
+
+    # 5. 時序轉換
     df_sorted = df.sort_values('拜訪時間 年/月/日')
     X_data, y_data, uuid_list = [], [], []
 
@@ -585,21 +612,20 @@ def prepare_lstm_data(df, time_steps=5, embedding_dim=100):
     for uid, group in grouped:
         vec_seq = [sentence_to_vec(row['斷詞結果']) for _, row in group.iterrows()]
         if len(vec_seq) < time_steps:
-            # 前面補零
             pad_len = time_steps - len(vec_seq)
             vec_seq = [np.zeros(embedding_dim)] * pad_len + vec_seq
         else:
-            vec_seq = vec_seq[-time_steps:]  # 只取最後 time_steps 筆
+            vec_seq = vec_seq[-time_steps:]
 
         X_data.append(vec_seq)
         y_data.append(group['是否有效拜訪'].iloc[0])
         uuid_list.append(uid)
 
-    return np.array(X_data, dtype='float32'), np.array(y_data, dtype='int32'), uuid_list, w2v_model
+    return np.array(X_data, dtype='float32'), np.array(y_data, dtype='int32'), uuid_list, w2v_model, tfidf
 
 
 # === 載入資料 ===
-X_lstm, y_lstm, uuids, w2v_model = prepare_lstm_data(df_filtered_1, time_steps=5, embedding_dim=100)
+X_lstm, y_lstm, uuids, w2v_model, tfidf_model = prepare_lstm_data(df_filtered_1, time_steps=5, embedding_dim=100)
 
 # === 建立模型（固定 input_shape，避開 symbolic tensor）===
 model = Sequential([
@@ -616,8 +642,13 @@ classes = np.unique(y_lstm)
 weights = compute_class_weight('balanced', classes=classes, y=y_lstm)
 class_weight_dict = {int(c): w for c, w in zip(classes, weights)}
 
-# === 訓練 ===
-model.fit(
+# 評估分類模型預測效果
+import matplotlib.pyplot as plt
+plt.rc('font', family = 'Microsoft JhengHei')
+plt.rcParams['axes.unicode_minus'] = False 
+
+# 訓練模型並記錄歷程
+history = model.fit(
     X_lstm, y_lstm,
     epochs=20,
     batch_size=32,
@@ -625,79 +656,48 @@ model.fit(
     class_weight=class_weight_dict
 )
 
+# 畫出 Loss 與 Accuracy 曲線
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='train_loss')
+plt.plot(history.history['val_loss'], label='val_loss')
+plt.title("Loss Curve")
+plt.xlabel("Epoch")
+plt.ylabel("Loss")
+plt.legend()
 
+plt.subplot(1, 2, 2)
+plt.plot(history.history['accuracy'], label='train_acc')
+plt.plot(history.history['val_accuracy'], label='val_acc')
+plt.title("Accuracy Curve")
+plt.xlabel("Epoch")
+plt.ylabel("Accuracy")
+plt.legend()
 
+plt.tight_layout()
+plt.show()
 
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
 
-import numpy as np
-import pandas as pd
-from tensorflow.keras.preprocessing.sequence import pad_sequences
+# 對驗證集（validation_split=0.2）做切分
+from sklearn.model_selection import train_test_split
+X_train, X_val, y_train, y_val = train_test_split(X_lstm, y_lstm, test_size=0.2, stratify=y_lstm, random_state=42)
 
-# 假設 df 為你的拜訪資料（每筆為一個備註）
-# 必備欄位：'客戶UUID', '拜訪時間', '斷詞結果'（list 格式）
+# 預測機率與類別
+y_pred_prob = model.predict(X_val)
+y_pred = (y_pred_prob > 0.5).astype(int)
 
-def prepare_lstm_data(df, time_steps=5, embedding_dim=100):
-    # 訓練 Word2Vec
-    token_lists = df['斷詞結果'].dropna().tolist()
-    w2v_model = Word2Vec(sentences=token_lists, vector_size=embedding_dim, window=3, min_count=1, workers=4, seed=42)
+# 評估指標
+print("\n📋 Classification Report:")
+print(classification_report(y_val, y_pred))
 
-    # 每段備註 → 詞向量平均
-    def sentence_to_vec(sentence):
-        vectors = [w2v_model.wv[word] for word in sentence if word in w2v_model.wv]
-        return np.mean(vectors, axis=0).astype('float32') if vectors else np.zeros(embedding_dim, dtype='float32')
+# 混淆矩陣
+cm = confusion_matrix(y_val, y_pred)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+disp.plot(cmap='Blues')
+plt.title("Confusion Matrix")
+plt.show()
 
-    X_data, y_data, uuid_list = [], [], []
-    grouped = df.sort_values('拜訪時間 年/月/日').groupby('客戶UUID')
-
-    for uid, group in grouped:
-        seq = [sentence_to_vec(row['斷詞結果']) for _, row in group.iterrows()]
-        padded_seq = pad_sequences([seq], maxlen=time_steps, dtype='float32', padding='pre', truncating='pre')[0]
-        X_data.append(padded_seq)
-        y_data.append(group['是否有效拜訪'].iloc[0]) 
-        uuid_list.append(uid)
-
-    return np.array(X_data), np.array(y_data), uuid_list, w2v_model
-
-
-X_lstm, y_lstm, uuids, w2v_model = prepare_lstm_data(df_filtered_1, time_steps=5, embedding_dim=100)
-
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-
-X_lstm = np.array(X_lstm)
-y_lstm = np.array(y_lstm)
-
-# 確保 input_shape 為 tuple of integers（非 tensor）
-input_shape = tuple(map(int, X_lstm.shape[1:])) 
-model = Sequential([
-    LSTM(64, input_shape=input_shape),
-    Dropout(0.3),
-    Dense(32, activation='relu'),
-    Dense(1, activation='sigmoid')
-])
-
-# # Over Sampling
-# from imblearn.over_sampling import SMOTE
-# sm = SMOTE(random_state=42)
-# X_res, y_res = sm.fit_resample(X_train, y_train)
-
-from sklearn.utils.class_weight import compute_class_weight
-
-
-
-model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
-
-# 確保 y_lstm 為 numpy array 且類別為 0/1
-classes = np.unique(y_lstm)
-weights = compute_class_weight('balanced', classes=classes, y=y_lstm)
-class_weight_dict = {int(c): w for c, w in zip(classes, weights)}
-
-# model.fit(X_lstm, y_lstm, epochs=10, batch_size=16, validation_split=0.2)
-model.fit(X_lstm, y_lstm, 
-          epochs=20, 
-          batch_size=32, 
-          validation_split=0.2, 
-          class_weight=class_weight_dict)
 
 # %% 新進業務員是否為保戶
 # 篩選簽約日在 2020/1/1 ~ 2024/12/31 之間的新進業務

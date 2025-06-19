@@ -267,6 +267,44 @@ def gender_diff(row):
 
 df4['業務客戶性別組合'] = df4.apply(gender_diff, axis=1)
 
+# %% 計算業務客戶距離
+from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
+from tqdm import tqdm
+
+# 初始化 geocoder（使用 OpenStreetMap）
+geolocator = Nominatim(user_agent="geo-distance-calculator")
+
+# 地址轉經緯度的函式（有錯誤會傳回 None）
+def get_location(address):
+    try:
+        location = geolocator.geocode(address)
+        return (location.latitude, location.longitude) if location else None
+    except:
+        return None
+
+# 建立地址座標欄位
+tqdm.pandas()
+df_agents['經緯度'] = df_agents['營業單位地址'].progress_apply(get_location)
+df_clients['經緯度'] = df_clients['郵遞區號'].progress_apply(lambda z: get_location(f"台灣 {z}"))
+
+# 合併成所有業務與所有客戶的配對
+df_pairs = df_agents.assign(key=1).merge(df_clients.assign(key=1), on='key').drop(columns='key')
+
+# 計算距離
+def calc_distance(row):
+    loc1 = row['經緯度_x']  # 業務
+    loc2 = row['經緯度_y']  # 客戶
+    if loc1 and loc2:
+        return geodesic(loc1, loc2).km
+    return None
+
+df_pairs['距離_km'] = df_pairs.progress_apply(calc_distance, axis=1)
+
+# 顯示結果
+print(df_pairs[['業務ID', '客戶ID', '距離_km']])
+
+
 # %% ckip
 import pandas as pd
 from ckiptagger import WS
@@ -474,7 +512,7 @@ unit_stats = df_filtered_1.groupby('營業單位').agg(
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
 from xgboost import XGBClassifier
@@ -482,8 +520,9 @@ from xgboost import XGBClassifier
 # ===== 1. 篩選與建立成交標籤 =====
 # df_model_1 = df_filtered_1[df_filtered_1['平均每客戶拜訪次數'] > 4].copy()
 # df_model_1['是否成交'] = df_model_1['是否有效拜訪']  # 或改為你要的成交定義
-
+describe = df_filtered_1.describe()
 y = df_filtered_1['是否有效拜訪']
+groups = df_filtered_1['客戶UUID']  # 分群欄位：同一位潛在業務員的拜訪紀錄歸為一群
 
 # ===== 2. 數值特徵欄位 =====
 numerical_cols = [
@@ -517,21 +556,38 @@ def vectorize_sentence_weighted(sentence):
 X_w2v_weighted = np.array([vectorize_sentence_weighted(s) for s in df_filtered_1['斷詞結果']])
 X_combined = np.hstack([X_w2v_weighted, X_num_scaled])
 
-# ===== 4. 資料切分與模型建構 =====
-X_trainval, X_test, y_trainval, y_test = train_test_split(
-    X_combined, y, test_size=0.2, stratify=y, random_state=42
+# Step 1: 取得每位客戶的唯一 ID
+unique_customers = df_filtered_1['客戶UUID'].unique()
+
+# Step 2: 分層切分客戶（先抽出 test 客戶）
+trainval_customers, test_customers = train_test_split(
+    unique_customers,
+    test_size=0.2,
+    random_state=42,
+    stratify=df_filtered_1.drop_duplicates('客戶UUID')['是否有效拜訪']
 )
 
-# 交叉驗證
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+# Step 3: 用客戶UUID篩選出對應資料
+trainval_mask = df_filtered_1['客戶UUID'].isin(trainval_customers)
+test_mask = df_filtered_1['客戶UUID'].isin(test_customers)
+
+# ===== 4. 資料切分與模型建構 =====
+X_trainval, X_test = X_combined[trainval_mask], X_combined[test_mask]
+y_trainval, y_test = y[trainval_mask], y[test_mask]
+
+# ===== 1. 初始化交叉驗證器 =====
+sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+
 roc_scores, pr_scores = [], []
 all_y_true, all_y_pred, all_y_proba = [], [], []
 
-for train_idx, val_idx in skf.split(X_trainval, y_trainval):
+# ===== 2. 執行交叉驗證（注意 groups 要與 X_trainval 對齊） =====
+for train_idx, val_idx in sgkf.split(X_trainval, y_trainval, groups=groups[trainval_mask]):
     X_train, X_val = X_trainval[train_idx], X_trainval[val_idx]
     y_train, y_val = y_trainval.iloc[train_idx], y_trainval.iloc[val_idx]
 
-    model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+    scale_ratio = df_filtered_1['是否有效拜訪'].value_counts()[0] / df_filtered_1['是否有效拜訪'].value_counts()[1]
+    model = XGBClassifier(scale_pos_weight=scale_ratio, use_label_encoder=False, eval_metric='logloss', random_state=42)
     model.fit(X_train, y_train)
 
     y_proba = model.predict_proba(X_val)[:, 1]
@@ -539,17 +595,20 @@ for train_idx, val_idx in skf.split(X_trainval, y_trainval):
 
     roc_scores.append(roc_auc_score(y_val, y_proba))
     pr_scores.append(average_precision_score(y_val, y_proba))
+
     all_y_true.extend(y_val)
     all_y_pred.extend(y_pred)
     all_y_proba.extend(y_proba)
 
-print("\n📊 Cross-Validation (Train Set)")
+# ===== 3. 報告交叉驗證結果 =====
+print("\n📊 Cross-Validation (Train Set, Grouped by 客戶UUID)")
 print(classification_report(all_y_true, all_y_pred))
 print(f"Average ROC AUC: {np.mean(roc_scores):.4f}")
 print(f"Average PR AUC : {np.mean(pr_scores):.4f}")
 
-# ===== 5. Hold-out 測試集評估 =====
-final_model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+
+# ===== Hold-out 測試集評估 =====
+final_model = XGBClassifier(scale_pos_weight=scale_ratio, use_label_encoder=False, eval_metric='logloss', random_state=42)
 final_model.fit(X_trainval, y_trainval)
 
 y_test_proba = final_model.predict_proba(X_test)[:, 1]
@@ -560,6 +619,202 @@ print(classification_report(y_test, y_test_pred))
 print(f"ROC AUC: {roc_auc_score(y_test, y_test_proba):.4f}")
 print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
 
+# %% shap
+# 總體解釋
+import shap
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+plt.rc('font', family = 'Microsoft JhengHei')
+plt.rcParams['axes.unicode_minus'] = False 
+
+
+# 只取數值欄位對應的 SHAP 值與資料
+num_start_idx = X_combined.shape[1] - len(numerical_cols)  # 數值特徵起始位置
+X_test_num = X_test[:, num_start_idx:]
+
+explainer = shap.TreeExplainer(final_model)
+shap_values = explainer.shap_values(X_test)
+
+shap_values_num = shap_values[:, num_start_idx:]
+
+# 特徵名稱
+feature_names = numerical_cols
+
+# ===== 1️⃣ 特徵重要性（條狀圖） =====
+shap_importance_df = pd.DataFrame({
+    'Feature': feature_names,
+    'MeanAbsSHAP': np.abs(shap_values_num).mean(axis=0)
+}).sort_values(by='MeanAbsSHAP', ascending=True)
+
+# 繪圖
+plt.figure(figsize=(8, 6))
+plt.barh(shap_importance_df['Feature'], shap_importance_df['MeanAbsSHAP'])
+plt.xlabel('Mean |SHAP value|')
+plt.title('Feature Importance (Numerical Only)')
+plt.tight_layout()
+plt.show()
+
+# ===== 2️⃣ SHAP summary plot（顏色代表數值大小） =====
+shap.summary_plot(shap_values_num, X_test_num, feature_names=feature_names)
+
+
+
+
+
+
+
+
+
+# 各變數解釋
+num_vars = [
+    '平均拜訪間隔天數', '每週平均拜訪客戶數', '業務客戶年齡差距', # '拜訪紀錄密度', 
+    '備註字數', '有意義詞數', 
+    '目前年資', # '當年度賽季增員數', 
+    '上半年準客戶數', '今年度活動參與率', '上年度FYC', '距離晉升天數', 
+    '件數', '總保費'
+]
+
+cat_vars = ['業務客戶性別組合', '最新職級', '拜訪目的', '營業單位_編碼']
+
+
+# # 輸出資料夾
+# output_dir = "D:/備註文字探勘/shap_2024"
+# os.makedirs(output_dir, exist_ok=True)
+
+# # 個別變數解釋
+# explainer = shap.Explainer(final_model, 
+#                            X_trainval, 
+#                            feature_names=final_feature_names, 
+#                            model_output='raw', 
+#                            feature_perturbation="interventional") # 減少隨機性
+
+# shap_values = explainer(X_trainval)
+
+def plot_shap_bin_auto_with_summary_dual_x(
+    X_data, shap_values, feature_names, variables,
+    mean_dict, scale_dict,
+    window=20, output_dir=None,
+    min_range_width=0.1, merge_gap=0.05
+):
+    summary_list = []
+
+    for var in variables:
+        try:
+            i = feature_names.index(var)
+            x = X_data[:, i]
+            shap_val = shap_values[:, i].values
+
+            df = pd.DataFrame({"值": x, "SHAP": shap_val}).sort_values("值").reset_index(drop=True)
+            df["SHAP_smooth"] = df["SHAP"].rolling(window=window, min_periods=1).mean()
+
+            df["is_neg"] = (df["SHAP_smooth"] < 0).astype(int)
+            df["neg_group"] = (df["is_neg"].diff(1) != 0).cumsum()
+            neg_segments = df[df["is_neg"] == 1].groupby("neg_group")
+            neg_ranges = [(seg["值"].min(), seg["值"].max()) for _, seg in neg_segments]
+
+            value_min, value_max = df["值"].min(), df["值"].max()
+            positive_ranges = []
+            current_start = value_min
+            for neg_start, neg_end in sorted(neg_ranges):
+                if current_start < neg_start:
+                    positive_ranges.append((current_start, neg_start))
+                current_start = max(current_start, neg_end)
+            if current_start < value_max:
+                positive_ranges.append((current_start, value_max))
+
+            positive_ranges = [(lo, hi) for lo, hi in positive_ranges if (hi - lo) >= min_range_width]
+
+            # 合併破碎段
+            merged_ranges = []
+            for lo, hi in sorted(positive_ranges):
+                if not merged_ranges:
+                    merged_ranges.append([lo, hi])
+                else:
+                    prev_lo, prev_hi = merged_ranges[-1]
+                    if lo - prev_hi <= merge_gap:
+                        merged_ranges[-1][1] = hi
+                    else:
+                        merged_ranges.append([lo, hi])
+
+            # 還原原始數值
+            mean, scale = mean_dict[var], scale_dict[var]
+            restored_ranges = [(lo * scale + mean, hi * scale + mean) for lo, hi in merged_ranges]
+
+            # 繪圖開始
+            fig, ax1 = plt.subplots(figsize=(8, 4))
+
+            ax1.scatter(df["值"], df["SHAP"], alpha=0.3, label="原始 SHAP")
+            ax1.plot(df["值"], df["SHAP_smooth"], color='blue', label="平滑趨勢")
+            ax1.axhline(0, color='gray', linestyle='--')
+            # ax1.axvline(peak_x, color='red', linestyle='--', 
+            #             label=f'最大貢獻點 = {peak_raw:,.2f}')  # ⭐ 貨幣格式)
+
+            for idx, ((lo, hi), (lo_raw, hi_raw)) in enumerate(zip(merged_ranges, restored_ranges)):
+                ax1.axvspan(lo, hi, color='lightgreen', alpha=0.3)
+                summary_list.append({
+                    '變數': var,
+                    '原始值區間_起': round(lo_raw, 2),
+                    '原始值區間_迄': round(hi_raw, 2),
+                    '標準化值_起': round(lo, 2),
+                    '標準化值_迄': round(hi, 2)
+                })
+
+            # 設定主 X 軸（標準化值）標籤在上方
+            ax1.xaxis.set_label_position('top')
+            ax1.xaxis.tick_top()
+            ax1.set_xlabel("標準化", labelpad=10)
+            ax1.set_ylabel("SHAP 值")
+            ax1.set_title(f"{var} 對成交的 SHAP 趨勢")
+            
+            # 雙 X 軸：下方顯示原始數值，對齊標準化 X 軸
+            def to_raw(x): return x * scale + mean
+            def to_std(x): return (x - mean) / scale
+            
+            # 替代 ax2 = ax1.twiny()
+            secax = ax1.secondary_xaxis('bottom', functions=(to_raw, to_std))
+            secax.set_xlabel("原始數值")
+            
+            # 平均與標準差說明
+            mean_text = f"原始平均值: {mean:,.2f}\n原始標準差: {scale:,.2f}"  # ⭐ 貨幣格式
+            ax1.text(0.98, 0.95, mean_text, transform=ax1.transAxes,
+                     ha='right', va='top', fontsize=8, color='dimgray',
+                     bbox=dict(boxstyle="round,pad=0.3", fc="white", ec="gray", alpha=0.5))
+
+            ax1.legend(loc='upper left')
+            ax1.grid(True)
+            
+            if output_dir:
+                filename = os.path.join(output_dir, f"{var}_shap_plot2.png")
+                plt.savefig(filename, dpi=300, bbox_inches='tight')
+                plt.close()
+                print(f"✅ 已儲存：{filename}")
+            else:
+                plt.tight_layout()
+            
+        except Exception as e:
+            print(f"❌ {var} 失敗：{e}")
+
+    return pd.DataFrame(summary_list)
+
+scaler = StandardScaler()
+X_num_scaled = scaler.fit_transform(X_num)  # <== 這是你原本做的
+
+mean_dict = dict(zip(numerical_cols, scaler.mean_))
+scale_dict = dict(zip(numerical_cols, scaler.scale_))
+
+df_summary = plot_shap_bin_auto_with_summary_dual_x(
+    X_data=X_trainval,
+    shap_values=shap_values,
+    feature_names=final_feature_names,
+    variables=num_vars,
+    mean_dict=mean_dict,
+    scale_dict=scale_dict,
+    window=20,
+    output_dir="D:/備註文字探勘/shap_2024",
+    min_range_width=0.1,
+    merge_gap=0.05
+)
 
 # %% model-lstm 
 import numpy as np

@@ -104,6 +104,10 @@ agent_summary = agent_summary.rename(columns={
 # 合併進主 df
 df2 = df1.merge(agent_summary, on='業代', how='left')
 
+# 匯入各營業單位地址
+address = pd.read_excel("D:/地區名稱.xlsx", sheet_name="營業單位地址") 
+df2 = df2.merge(address, on='營業單位', how='left')
+
 # 晉升日轉換
 def convert_yyyymm_to_datetime(x):
     if x == 0 or pd.isna(x):
@@ -136,7 +140,7 @@ customer_filter = customer[customer['性別'].isin(['男', '女'])]
 # customer_filter['建立時間 年/月/日'] = pd.to_datetime(customer_filter['建立時間 年/月/日'])
 
 # 從 customer_filter 中取出需要的欄位
-customer_basic = customer_filter[['客戶UUID', '客戶姓名', '性別', '生日 年/月/日', '客戶目前年齡']]
+customer_basic = customer_filter[['客戶UUID', '客戶姓名', '性別', '生日 年/月/日', '客戶目前年齡', '通訊地郵遞區號']]
 
 # 建立分類欄位：「準客戶」與「新增保戶」
 def classify_customer_type(ctype):
@@ -183,6 +187,11 @@ df3[['歷年準增數', '歷年新增業務數']] = df3[['歷年準增數', '歷
 
 # policy
 policy = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="policy") 
+
+# 確保日期欄位正確格式
+policy['投保日 年/月/日'] = pd.to_datetime(policy['投保日 年/月/日'], errors='coerce')
+policy['簽約日 年/月/日'] = pd.to_datetime(policy['簽約日 年/月/日'], errors='coerce')
+
 # 對每位經紀人1-被保人做加總
 policy_summary = (
     policy
@@ -202,6 +211,55 @@ df4 = df3.merge(
 # 只保留 df3 原始欄位名稱
 df4 = df4.drop(columns=['經紀人1-被保人CRM UUID'])
 
+
+# # 建立是否業務員標記
+# policy['是否為業務'] = policy['被保人業代'].notna().astype(int)
+
+# # 資料清理：保證保費與受理件數為數值
+# policy['繳款保費new'] = pd.to_numeric(policy['繳款保費new'], errors='coerce')
+# policy['受理件數'] = pd.to_numeric(policy['受理件數'], errors='coerce')
+
+# # 分別篩選是業務員與非業務員
+# policy_agent_before = policy[(policy['是否為業務'] == 1) & (policy['投保日 年/月/日'] < policy['簽約日 年/月/日'])]
+# policy_non_agent = policy[policy['是否為業務'] == 0]
+
+# # 計算加總
+# agent_summary = (
+#     policy_agent_before.groupby(['被保人', '被保人業代', '經紀人1-被保人CRM UUID'])
+#     .agg(
+#         總保費=('繳款保費new', 'sum'),
+#         總受理件數=('受理件數', 'sum')
+#     )
+#     .reset_index()
+# )
+# agent_summary['群體'] = '業務員'
+
+# # 4. 以被保人計算非業務員群體：總保費與件數
+# non_agent_summary = (
+#     policy_non_agent.groupby(['被保人', '經紀人1-被保人CRM UUID'])
+#     .agg(
+#         總保費=('繳款保費new', 'sum'),
+#         總受理件數=('受理件數', 'sum')
+#     )
+#     .reset_index()
+# )
+# non_agent_summary['群體'] = '非業務員'
+
+# # 合併資料
+# final = pd.concat([agent_summary, non_agent_summary], axis=0, ignore_index=True)
+
+# # 合併到原本的 df 中（假設 df 有 "經紀人1-被保人CRM UUID" 欄位）
+# # 將 policy_summary 合併進 df3，對應欄位不同，但不更動原始欄位名稱
+# df4 = df3.merge(
+#     final,
+#     left_on='客戶UUID',
+#     right_on='經紀人1-被保人CRM UUID',
+#     how='left'
+# )
+
+# # 只保留 df3 原始欄位名稱
+# df4 = df4.drop(columns=['經紀人1-被保人CRM UUID'])
+
 # 業務客戶匹配
 # 1. 處理 agent 資料
 df4['業務生日'] = pd.to_datetime(df4['業務生日'], format='%Y%m%d', errors='coerce')  # 將 19901020 -> datetime
@@ -218,32 +276,32 @@ agent_keys = set(df4['業務姓名生日key'].dropna())
 df4['客戶是否為業務'] = df4['客戶姓名生日key'].isin(agent_keys).astype(int)
 
 
-summary_1 = (
-    df4.groupby('客戶是否為業務')
-    .agg(
-        人數=('業代', 'nunique'),
-        平均簽約年齡=('簽約時年齡', 'mean'),
-        中位數簽約年齡=('簽約時年齡', 'median'),
-        平均簽約年限=('簽約日 年/月/日', lambda s: ((pd.Timestamp('today') - s).dt.days/365).mean())
-    )
-    .reset_index()
-)
+# summary_1 = (
+#     df4.groupby('客戶是否為業務')
+#     .agg(
+#         人數=('業代', 'nunique'),
+#         平均簽約年齡=('簽約時年齡', 'mean'),
+#         中位數簽約年齡=('簽約時年齡', 'median'),
+#         平均簽約年限=('簽約日 年/月/日', lambda s: ((pd.Timestamp('today') - s).dt.days/365).mean())
+#     )
+#     .reset_index()
+# )
 
-# 建立業務 key → 簽約日對照表（如一位業務有多筆，只取最早）
-agent_sign_dates = (
-    df4[['業務姓名生日key', '簽約日 年/月/日']]
-    .dropna()
-    .drop_duplicates('業務姓名生日key')  # 一個 key 一筆
-    .set_index('業務姓名生日key')
-)
+# # 建立業務 key → 簽約日對照表（如一位業務有多筆，只取最早）
+# agent_sign_dates = (
+#     df4[['業務姓名生日key', '簽約日 年/月/日']]
+#     .dropna()
+#     .drop_duplicates('業務姓名生日key')  # 一個 key 一筆
+#     .set_index('業務姓名生日key')
+# )
 
-# 將業務簽約日合併到 df4（根據客戶是否成為業務，將其 key 對應到業務 key 的簽約日）
-df4['對應業務簽約日'] = df4['客戶姓名生日key'].map(agent_sign_dates['簽約日 年/月/日'])
+# # 將業務簽約日合併到 df4（根據客戶是否成為業務，將其 key 對應到業務 key 的簽約日）
+# df4['對應業務簽約日'] = df4['客戶姓名生日key'].map(agent_sign_dates['簽約日 年/月/日'])
 
 # 判斷是否為有效拜訪：成為業務且拜訪日在簽約日前
 df4['是否有效拜訪'] = (
     (df4['客戶是否為業務'] == 1) &
-    (df4['對應業務簽約日'] >= df4['拜訪時間 年/月/日'])
+    (df4['簽約日 年/月/日'] >= df4['拜訪時間 年/月/日'])
 ).astype(int)
 
 # 5. 計算年齡差與性別差
@@ -268,41 +326,62 @@ def gender_diff(row):
 df4['業務客戶性別組合'] = df4.apply(gender_diff, axis=1)
 
 # %% 計算業務客戶距離
-from geopy.geocoders import Nominatim
+import pandas as pd
+import xml.etree.ElementTree as ET
+
+# 載入 XML 檔案（你可以先下載到本地，或用 requests 讀網址）
+tree = ET.parse("C:/Users/Z01788/Downloads/1050812_行政區經緯度(toPost).xml")  # 檔名請用你的實際路徑
+root = tree.getroot()
+
+# 建立空 list 裝資料
+data = []
+
+# 找出每一筆行政區記錄
+for item in root.findall(".//_x0031_050429_行政區經緯度_x0028_toPost_x0029_"):
+    name = item.findtext("行政區名")
+    zipcode = item.findtext("_x0033_碼郵遞區號")
+    lon = item.findtext("中心點經度")
+    lat = item.findtext("中心點緯度")
+    
+    if zipcode and lat and lon:
+        data.append({
+            "郵遞區號": zipcode.strip(),
+            "行政區名": name.strip(),
+            "緯度": float(lat),
+            "經度": float(lon)
+        })
+
+# 轉為 DataFrame
+zipcode_df = pd.DataFrame(data)
+zipcode_df["郵遞區號"] = zipcode_df["郵遞區號"].astype(str)
+
+# 客戶與業務資料補上經緯度
+# 客戶
+df4["客戶郵遞區號"] = df4["通訊地郵遞區號"].astype(str).str[:3]
+df4 = df4.merge(zipcode_df.rename(columns={
+    "郵遞區號": "客戶郵遞區號",
+    "緯度": "客戶緯度",
+    "經度": "客戶經度"
+}), on="客戶郵遞區號", how="left")
+
+# 業務（若你已轉換營業單位為郵遞區號）
+df4["營業單位郵遞區號"] = df4["郵遞區號"].astype(str).str[:3]
+df4 = df4.merge(zipcode_df.rename(columns={
+    "郵遞區號": "營業單位郵遞區號",
+    "緯度": "業務緯度",
+    "經度": "業務經度"
+}), on="營業單位郵遞區號", how="left")
+
 from geopy.distance import geodesic
-from tqdm import tqdm
 
-# 初始化 geocoder（使用 OpenStreetMap）
-geolocator = Nominatim(user_agent="geo-distance-calculator")
-
-# 地址轉經緯度的函式（有錯誤會傳回 None）
-def get_location(address):
-    try:
-        location = geolocator.geocode(address)
-        return (location.latitude, location.longitude) if location else None
-    except:
-        return None
-
-# 建立地址座標欄位
-tqdm.pandas()
-df_agents['經緯度'] = df_agents['營業單位地址'].progress_apply(get_location)
-df_clients['經緯度'] = df_clients['郵遞區號'].progress_apply(lambda z: get_location(f"台灣 {z}"))
-
-# 合併成所有業務與所有客戶的配對
-df_pairs = df_agents.assign(key=1).merge(df_clients.assign(key=1), on='key').drop(columns='key')
-
-# 計算距離
 def calc_distance(row):
-    loc1 = row['經緯度_x']  # 業務
-    loc2 = row['經緯度_y']  # 客戶
-    if loc1 and loc2:
-        return geodesic(loc1, loc2).km
+    if pd.notna(row["業務緯度"]) and pd.notna(row["客戶緯度"]):
+        a = (row["業務緯度"], row["業務經度"])
+        b = (row["客戶緯度"], row["客戶經度"])
+        return geodesic(a, b).km
     return None
 
-df_pairs['距離_km'] = df_pairs.progress_apply(calc_distance, axis=1)
-
-# 顯示結果
-print(df_pairs[['業務ID', '客戶ID', '距離_km']])
+df4["距離_km"] = df4.apply(calc_distance, axis=1)
 
 
 # %% ckip
@@ -462,7 +541,7 @@ def extract_recruit_features_from_tokenlist(df,
 
     return df, recruit_words_set
 
-df_new, recruit_words = extract_recruit_features_from_tokenlist(df4)
+df_new, recruit_words = extract_recruit_features_from_tokenlist(df5)
 
 # %% filter 
 # 缺失值處理
@@ -474,6 +553,7 @@ keep_cols = [
     '業務目前年齡', '業務性別', '業務生日', '目前年資', '晉升日', '距離晉升天數', '歷年新增業務數',
     '歷年準增數', '客戶姓名', '性別', '生日 年/月/日', '客戶類型', '受理件數', '繳款保費new',
     '客戶生日', '客戶是否為業務', '是否有效拜訪', '客戶業務年齡差距', '業務客戶性別組合', 
+    '距離_km', '(增)拜訪目的', '方式', 
     '斷詞結果', '增員語意詞數', '備註字數'
 ]
 
@@ -499,7 +579,7 @@ df_filtered_1 = df_filtered[df_filtered['平均每客戶拜訪次數'] > 4]
 
 invalid_visits = df_new[
     (df_new['客戶是否為業務'] == 1) &
-    (df_new['對應業務簽約日'] < df_new['拜訪時間 年/月/日'])
+    (df_new['簽約日'] < df_new['拜訪時間 年/月/日'])
 ]
 
 unit_stats = df_filtered_1.groupby('營業單位').agg(
@@ -507,6 +587,7 @@ unit_stats = df_filtered_1.groupby('營業單位').agg(
     客戶數=('客戶UUID', 'nunique'),
     拜訪次數=('拜訪紀錄UUID', 'nunique')
 ).reset_index()
+
 
 # %% model-xgboost
 import numpy as np
@@ -526,13 +607,17 @@ groups = df_filtered_1['客戶UUID']  # 分群欄位：同一位潛在業務員�
 
 # ===== 2. 數值特徵欄位 =====
 numerical_cols = [
-    '業務客戶性別組合', '最新職級', '平均每客戶拜訪次數', '目前年資', 
-    '距離晉升天數', '備註字數', '增員語意詞數', '受理件數', '繳款保費new',
-    '業務目前年齡', '客戶業務年齡差距'
+    '平均每客戶拜訪次數', '目前年資', '距離晉升天數', '最新職級', 
+    '備註字數', '增員語意詞數', '受理件數', 
+    '繳款保費new', '客戶業務年齡差距', '業務客戶性別組合', '距離_km'
 ]
 
 X_num = df_filtered_1[numerical_cols].fillna(0)
 X_num_scaled = StandardScaler().fit_transform(X_num)
+
+# categoriacal & ordinal variables
+categorical_cols = ['(增)拜訪目的', '方式']
+df_cat_encoded = pd.get_dummies(df_filtered_1[categorical_cols])
 
 # ===== 3. 建立 Word2Vec 模型與 TF-IDF 加權 =====
 sentences = df_filtered_1['斷詞結果'].dropna().tolist()
@@ -554,8 +639,15 @@ def vectorize_sentence_weighted(sentence):
     return np.sum(vecs, axis=0) / np.sum(weights) if vecs else np.zeros(w2v_model.vector_size)
 
 X_w2v_weighted = np.array([vectorize_sentence_weighted(s) for s in df_filtered_1['斷詞結果']])
-X_combined = np.hstack([X_w2v_weighted, X_num_scaled])
 
+# Step 3: 組合數值 + one-hot + Word2Vec 向量
+X_combined = np.hstack([
+    X_w2v_weighted,        # TF-IDF weighted word vectors
+    X_num_scaled,          # 標準化後數值欄位
+    df_cat_encoded.values  # One-hot 類別欄位
+])
+
+# ===================================================
 # Step 1: 取得每位客戶的唯一 ID
 unique_customers = df_filtered_1['客戶UUID'].unique()
 
@@ -618,6 +710,45 @@ print("\n🧪 Final Evaluation on Hold-out Test Set")
 print(classification_report(y_test, y_test_pred))
 print(f"ROC AUC: {roc_auc_score(y_test, y_test_proba):.4f}")
 print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
+
+
+# 沒切分客戶uuid
+from sklearn.model_selection import StratifiedKFold
+
+# 資料切分
+X_trainval, X_test, y_trainval, y_test = train_test_split(
+    X_combined,
+    y,
+    test_size=0.2,
+    random_state=42,
+    stratify=y
+)
+
+# 初始化交叉驗證器（不分群）
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+roc_scores, pr_scores = [], []
+all_y_true, all_y_pred, all_y_proba = [], [], []
+
+for train_idx, val_idx in skf.split(X_trainval, y_trainval):
+    X_train, X_val = X_trainval[train_idx], X_trainval[val_idx]
+    y_train, y_val = y_trainval.iloc[train_idx], y_trainval.iloc[val_idx]
+
+    scale_ratio = y_train.value_counts()[0] / y_train.value_counts()[1]
+    model = XGBClassifier(scale_pos_weight=scale_ratio, use_label_encoder=False, eval_metric='logloss', random_state=42)
+    model.fit(X_train, y_train)
+
+    y_proba = model.predict_proba(X_val)[:, 1]
+    y_pred = (y_proba >= 0.6).astype(int)
+
+    roc_scores.append(roc_auc_score(y_val, y_proba))
+    pr_scores.append(average_precision_score(y_val, y_proba))
+    all_y_true.extend(y_val)
+    all_y_pred.extend(y_pred)
+    all_y_proba.extend(y_proba)
+
+
+
 
 # %% shap
 # 總體解釋
@@ -960,70 +1091,292 @@ agent2 = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="agent2")
 # 確保兩欄都是 datetime 格式
 agent2['簽約日 年/月/日'] = pd.to_datetime(agent2['簽約日 年/月/日'], errors='coerce')
 agent2['生日'] = pd.to_datetime(agent2['生日'], format='%Y%m%d', errors='coerce')  
+agent2['性別'] = agent2['性別'].astype(str)
 
 # 計算簽約當下年齡（以年為單位，向下取整）
 agent2['簽約時年齡'] = ((agent2['簽約日 年/月/日'] - agent2['生日']).dt.days // 365).astype(int)
 
-policy2 = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="policy2") 
-policy2['被保人生日 年/月/日'] = pd.to_datetime(policy2['被保人生日 年/月/日'], format='%Y%m%d', errors='coerce')
+# policy2 = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="policy2") 
+# policy2['被保人生日 年/月/日'] = pd.to_datetime(policy2['被保人生日 年/月/日'], format='%Y%m%d', errors='coerce')
+# policy2['性別'] = policy2['性別'].astype(str)
 
 # 1. 建立比對 key
-agent2['姓名生日key'] = agent2['業務員'].astype(str) + '_' + agent2['生日'].astype(str)
-policy2['姓名生日key'] = policy2['被保人'].astype(str) + '_' + policy2['被保人生日 年/月/日'].astype(str)
+agent2['姓名生日性別key'] = agent2['業務員'].astype(str) + '_' + agent2['生日'].astype(str) + '_' + agent2['性別']
+# policy2['姓名生日性別key'] = policy2['被保人'].astype(str) + '_' + policy2['被保人生日 年/月/日'].astype(str) + '_' + policy2['性別']
+
+# # 2. 建立：客戶 -> 最早交易日的查詢表
+# policy_key_date = policy2.set_index('姓名生日性別key')['最小值 投保日'].to_dict()
+
+# # 3. 判斷是否為保戶
+# def is_existing_customer(row):
+#     key = row['姓名生日性別key']
+#     trade_date = policy_key_date.get(key)
+#     if pd.notnull(trade_date) and trade_date < row['簽約日 年/月/日']:
+#         return 1
+#     return 0
+
+# # 4. 套用判斷
+# agent2['成為業務前是否為保戶'] = agent2.apply(is_existing_customer, axis=1)
+
+# # 5. 統計
+# summary = (
+#     agent2.groupby('成為業務前是否為保戶')
+#     .agg(
+#         人數=('業代', 'nunique'),
+#         平均簽約年齡=('簽約時年齡', 'mean'),
+#         中位數簽約年齡=('簽約時年齡', 'median'),
+#         平均簽約年限=('簽約日 年/月/日', lambda s: ((pd.Timestamp('today') - s).dt.days/365).mean())
+#     )
+#     .reset_index()
+# )
+
+# # 6. 占比
+# total = agent2['業代'].nunique()
+# summary['占比'] = summary['人數'] / total
+
+# print(summary)
+
+# # 近五年新進業務員
+# mask = (agent2['簽約日 年/月/日'] >= '2020-01-01') & (agent2['簽約日 年/月/日'] <= '2024-12-31')
+# agent2_filtered = agent2[mask].copy()
+
+policy3 = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="工作表3") 
+policy3['被保人生日 年/月/日'] = pd.to_datetime(policy3['被保人生日 年/月/日'], format='%Y%m%d', errors='coerce')  
+
+policy3['姓名生日性別key'] = policy3['被保人'].astype(str) + '_' + policy3['被保人生日 年/月/日'].astype(str) + '_' + policy3['被保人性別']
 
 # 2. 建立：客戶 -> 最早交易日的查詢表
-policy_key_date = policy2.set_index('姓名生日key')['最小值 投保日'].to_dict()
+policy_key_date = (
+    policy3.sort_values('投保日 年/月/日')  # 先排序
+    .drop_duplicates('姓名生日性別key', keep='first')  # 保留最早投保日
+    .set_index('姓名生日性別key')['投保日 年/月/日']
+    .to_dict()
+)
 
-# 3. 判斷每位業務在簽約前是否為客戶（flag 為 1 表示有，0 表示無）
+# 3. 判斷是否為保戶
 def is_existing_customer(row):
-    key = row['姓名生日key']
+    key = row['姓名生日性別key']
     trade_date = policy_key_date.get(key)
     if pd.notnull(trade_date) and trade_date < row['簽約日 年/月/日']:
         return 1
     return 0
 
+# 4. 套用判斷
 agent2['成為業務前是否為保戶'] = agent2.apply(is_existing_customer, axis=1)
 
-# 5. 統計
+# 只保留需要的欄位
+agent_key = (
+    agent2[['姓名生日性別key', '簽約日 年/月/日', '成為業務前是否為保戶']]
+    .drop_duplicates(subset='姓名生日性別key')
+)
+
+# 合併簽約日到保單資料
+policy_agent = policy3.merge(agent_key, on='姓名生日性別key', how='inner')
+
+# 篩選簽約日前的保單
+policy_before = policy_agent[policy_agent['投保日 年/月/日'] < policy_agent['簽約日 年/月/日']].copy()
+
+# 計算每位業務在簽約前的保費與保單種類
 summary = (
-    agent2.groupby('成為業務前是否為保戶')
+    policy_before.groupby('姓名生日性別key')
     .agg(
-        人數=('業代', 'nunique'),
-        平均簽約年齡=('簽約時年齡', 'mean'),
-        中位數簽約年齡=('簽約時年齡', 'median'),
-        平均簽約年限=('簽約日 年/月/日', lambda s: ((pd.Timestamp('today') - s).dt.days/365).mean())
+        成為業務前是否為保戶=('成為業務前是否為保戶', 'first'),
+        簽約日=('簽約日 年/月/日', 'first'), 
+        簽約前總保費=('繳款保費new', 'sum'),
+        簽約前受理件數=('受理件數', 'sum')
     )
     .reset_index()
 )
 
-# 6. 占比
-total = agent2['業代'].nunique()
-summary['占比'] = summary['人數'] / total
 
-print(summary)
+df4['生日 年/月/日'] = pd.to_datetime(df4['生日 年/月/日'], format='%Y%m%d', errors='coerce')  
+df4['姓名生日性別key'] = df4['客戶姓名'].astype(str) + '_' + df4['生日 年/月/日'].astype(str) + '_' + df4['性別']
 
-# 近五年新進業務員
-mask = (agent2['簽約日 年/月/日'] >= '2020-01-01') & (agent2['簽約日 年/月/日'] <= '2024-12-31')
-agent2_filtered = agent2[mask].copy()
+# 合併，summary 的姓名生日key 對應到 df4 的 客戶姓名生日key
+df5 = df4.merge(
+    summary,
+    left_on='姓名生日性別key',
+    right_on='姓名生日性別key',
+    how='left'
+)
+
+df5['客戶簽約時年齡'] = (
+    ((df5['簽約日'] - df5['生日 年/月/日']).dt.days // 365)
+    .where(df5['簽約日'].notna())
+)
 
 
-# 重新統計僅針對 2020~2024 的新進業務
-summary = (
-    agent2_filtered.groupby('成為業務前是否為保戶')
+# Plot
+import seaborn as sns
+
+# 設定風格
+plt.style.use('default')
+plt.rc('font', family = 'Microsoft JhengHei')
+plt.rcParams['axes.unicode_minus'] = False 
+
+unique_agent = (
+    agent2.drop_duplicates(subset='姓名生日性別key')
+)
+
+# 業務員背景 2020~2024
+mask_agent = (unique_agent['簽約日 年/月/日'] >= '2020-01-01') & (unique_agent['簽約日 年/月/日'] <= '2024-12-31')
+unique_agent_5y = unique_agent[mask_agent].copy()
+unique_agent_5y['成為業務前是否為保戶'].value_counts()
+
+# 計算簽約年資（以今日為基準）
+unique_agent_5y['簽約年資'] = ((pd.Timestamp('today') - unique_agent_5y['簽約日 年/月/日']).dt.days / 365)
+
+# 分群統計
+group_summary_5y = (
+    unique_agent_5y.groupby('成為業務前是否為保戶')
     .agg(
-        人數=('業代', 'nunique'),
+        業務員數=('業代', 'nunique'),
         平均簽約年齡=('簽約時年齡', 'mean'),
         中位數簽約年齡=('簽約時年齡', 'median'),
-        平均簽約年限=('簽約日 年/月/日', lambda s: ((pd.Timestamp('today') - s).dt.days / 365).mean())
+        最小簽約年齡=('簽約時年齡', 'min'),
+        最大簽約年齡=('簽約時年齡', 'max'),
+        平均簽約年資=('簽約年資', 'mean'),
+        中位數簽約年資=('簽約年資', 'median')
     )
     .reset_index()
 )
 
-# 計算占比
-total = agent2_filtered['業代'].nunique()
-summary['占比'] = summary['人數'] / total
+total = unique_agent_5y['業代'].nunique()
+group_summary_5y['占比'] = group_summary_5y['業務員數'] / total
 
-print(summary)
+filter_test = policy3[
+    policy3['姓名生日性別key'].str.startswith('何佳*_1966-02-26_女', na=False)
+]
+# ======================
 
 
+# 分組繪圖
+for group_value, group_data in unique_agent.groupby('成為業務前是否為保戶'):
+    
+    # 轉換群體標籤
+    group_label = '原為保戶' if group_value == 1 else '非保戶'
+
+    # 抓出有效年齡資料
+    data = group_data['簽約時年齡'].dropna()
+
+    plt.figure()
+    sns.histplot(data, bins=20, kde=True)
+    plt.title(f'{group_label} 簽約時年齡分布 (n={len(data)})')
+    plt.xlabel('簽約時年齡')
+    plt.ylabel('人數')
+    plt.show()
+
+
+
+
+# 有拜訪紀錄的
+# 1. 簽約時年齡分布（排除缺漏值）
+plt.figure()
+sns.histplot(df5['客戶簽約時年齡'].dropna(), bins=20, kde=True)
+plt.title(f'簽約時年齡分布 (n={len(data)})')
+plt.xlabel('簽約時年齡')
+plt.ylabel('人數')
+plt.show()
+
+# 2. 性別比例
+plt.figure()
+data = df5['性別'].dropna()
+data.value_counts().plot.pie(autopct='%1.1f%%', startangle=90)
+plt.title(f'性別比例 (n={len(data)})')
+plt.ylabel('')
+plt.show()
+
+# 3. 客戶類型分布
+plt.figure()
+df5['客戶類型'].value_counts().plot.bar()
+plt.title('客戶類型分布')
+plt.xlabel('客戶類型')
+plt.ylabel('人數')
+plt.show()
+
+# 4. 總保費分布（去除極端值，上限設為保費95%分位數）
+upper_limit = df5['總保費'].quantile(0.95)
+data = df5[df5['總保費'] <= upper_limit]['總保費'].dropna()
+plt.figure()
+sns.histplot(data, bins=30, kde=True)
+plt.title(f'總保費分布 (排除極端值) (n={len(data)})')
+plt.xlabel('總保費')
+plt.ylabel('人數')
+plt.show()
+
+# 5. 群體分布（業務員 vs 非業務員）
+plt.figure()
+data = df5['群體'].dropna()
+data.value_counts().plot.bar()
+plt.title(f'群體分布（是否為業務員） (n={len(data)})')
+plt.xlabel('群體')
+plt.ylabel('人數')
+plt.show()
+
+
+
+# describe_2 = agent2_filtered.describe().T
+
+# # 重新統計僅針對 2020~2024 的新進業務
+# summary = (
+#     agent2_filtered.groupby('成為業務前是否為保戶')
+#     .agg(
+#         人數=('業代', 'nunique'),
+#         平均簽約年齡=('簽約時年齡', 'mean'),
+#         中位數簽約年齡=('簽約時年齡', 'median'),
+#         平均簽約年限=('簽約日 年/月/日', lambda s: ((pd.Timestamp('today') - s).dt.days / 365).mean())
+#     )
+#     .reset_index()
+# )
+
+# # 計算占比
+# total = agent2_filtered['業代'].nunique()
+# summary['占比'] = summary['人數'] / total
+
+# print(summary)
+
+
+
+# 以業代為單位，整理業務員資訊
+agent_summary = (
+    agent2.groupby('業代')
+    .agg(
+        業務員=('業務員', 'first'),
+        成為業務前是否為保戶=('成為業務前是否為保戶', 'first'),
+        簽約時年齡=('簽約時年齡', 'first'),
+        簽約日=('簽約日 年/月/日', 'first'), 
+        性別=('性別', 'first'), 
+        目前年齡=('目前年齡', 'first')
+    )
+    .reset_index()
+)
+
+# 計算簽約年資（以今日為基準）
+agent_summary['簽約年資'] = ((pd.Timestamp('today') - agent_summary['簽約日']).dt.days / 365)
+
+
+# 篩選近五年新進業務員
+agent_summary_5y = agent_summary[
+    (agent_summary['簽約日'] >= '2020-01-01') & (agent_summary['簽約日'] <= '2024-12-31')
+]
+
+# 分群統計
+group_summary_5y = (
+    agent_summary_5y.groupby('成為業務前是否為保戶')
+    .agg(
+        業務員數=('業代', 'nunique'),
+        平均簽約年齡=('簽約時年齡', 'mean'),
+        中位數簽約年齡=('簽約時年齡', 'median'),
+        最小簽約年齡=('簽約時年齡', 'min'),
+        最大簽約年齡=('簽約時年齡', 'max'),
+        平均簽約年資=('簽約年資', 'mean'),
+        中位數簽約年資=('簽約年資', 'median')
+    )
+    .reset_index()
+)
+
+group_summary_5y['身分說明'] = group_summary_5y['成為業務前是否為保戶'].map({1: '原為保戶', 0: '非保戶'})
+group_summary_5y = group_summary_5y[['身分說明', '業務員數', '平均簽約年齡', '中位數簽約年齡', '最小簽約年齡', '最大簽約年齡', '平均簽約年資', '中位數簽約年資']]
+
+print(group_summary_5y)
 

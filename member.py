@@ -260,20 +260,19 @@ df4 = df4.drop(columns=['經紀人1-被保人CRM UUID'])
 # # 只保留 df3 原始欄位名稱
 # df4 = df4.drop(columns=['經紀人1-被保人CRM UUID'])
 
-# 業務客戶匹配
 # 1. 處理 agent 資料
 df4['業務生日'] = pd.to_datetime(df4['業務生日'], format='%Y%m%d', errors='coerce')  # 將 19901020 -> datetime
-df4['業務姓名生日key'] = df4['業務員'] + df4['業務生日'].dt.strftime('%Y-%m-%d')
+df4['業務姓名生日性別key'] = df4['業務員'].astype(str) + '_' + df4['業務生日'].dt.strftime('%Y-%m-%d') + '_' + df4['業務性別']
 
 # 2. 處理 customer 資料
 df4['客戶生日'] = pd.to_datetime(df4['生日 年/月/日'], errors='coerce')
-df4['客戶姓名生日key'] = df4['客戶姓名'] + df4['客戶生日'].dt.strftime('%Y-%m-%d')
+df4['客戶姓名生日性別key'] = df4['客戶姓名'].astype(str) + '_' + df4['客戶生日'].dt.strftime('%Y-%m-%d') + '_' + df4['性別']
 
-# 建立業務姓名生日key集合（整體的 set，避免逐行比對）
-agent_keys = set(df4['業務姓名生日key'].dropna())
+# 建立業務姓名生日性別key集合（整體的 set，避免逐行比對）
+agent_keys = set(df4['業務姓名生日性別key'].dropna())
 
-# 判斷客戶是否成為業務：看客戶key是否出現在業務key集合中
-df4['客戶是否為業務'] = df4['客戶姓名生日key'].isin(agent_keys).astype(int)
+# # 判斷客戶是否成為業務：看客戶key是否出現在業務key集合中
+# df4['客戶是否為業務'] = df4['客戶姓名生日性別key'].isin(agent_keys).astype(int)
 
 
 # summary_1 = (
@@ -298,17 +297,18 @@ df4['客戶是否為業務'] = df4['客戶姓名生日key'].isin(agent_keys).ast
 # # 將業務簽約日合併到 df4（根據客戶是否成為業務，將其 key 對應到業務 key 的簽約日）
 # df4['對應業務簽約日'] = df4['客戶姓名生日key'].map(agent_sign_dates['簽約日 年/月/日'])
 
-# 判斷是否為有效拜訪：成為業務且拜訪日在簽約日前
-df4['是否有效拜訪'] = (
-    (df4['客戶是否為業務'] == 1) &
-    (df4['簽約日 年/月/日'] >= df4['拜訪時間 年/月/日'])
-).astype(int)
+# # 判斷是否為有效拜訪：成為業務且拜訪日在簽約日前
+# df4['是否有效拜訪'] = (
+#     (df4['客戶是否為業務'] == 1) &
+#     (df4['簽約日 年/月/日'] >= df4['拜訪時間 年/月/日'])
+# ).astype(int)
 
 # 5. 計算年齡差與性別差
 df4['客戶業務年齡差距'] = (
     (df4['客戶生日'] - df4['業務生日']).dt.days / 365
 ).round(1)
 
+# 業務客戶匹配
 sex_stage = {'男': 0, '女': 1}
 df4['客戶性別'] = df4['性別'].map(sex_stage)
 df4['業務性別'] = df4['業務性別'].map(sex_stage)
@@ -484,6 +484,97 @@ def extract_and_segment_notes(df, note_column='拜訪備註', ckip_model_path='.
 
 df4 = extract_and_segment_notes(df4, note_column='拜訪備註', ckip_model_path='./data')
 
+# %% 新進業務員是否為保戶
+# 篩選簽約日在 2020/1/1 ~ 2024/12/31 之間的新進業務
+agent2 = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="agent2") 
+# 確保兩欄都是 datetime 格式
+agent2['簽約日 年/月/日'] = pd.to_datetime(agent2['簽約日 年/月/日'], errors='coerce')
+agent2['生日'] = pd.to_datetime(agent2['生日'], format='%Y%m%d', errors='coerce')  
+agent2['性別'] = agent2['性別'].astype(str)
+
+# 計算簽約當下年齡（以年為單位，向下取整）
+agent2['簽約時年齡'] = ((agent2['簽約日 年/月/日'] - agent2['生日']).dt.days // 365).astype(int)
+agent2['姓名生日性別key'] = agent2['業務員'].astype(str) + '_' + agent2['生日'].astype(str) + '_' + agent2['性別']
+
+policy3 = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="工作表3") 
+policy3['被保人生日 年/月/日'] = pd.to_datetime(policy3['被保人生日 年/月/日'], format='%Y%m%d', errors='coerce')  
+
+policy3['姓名生日性別key'] = policy3['被保人'].astype(str) + '_' + policy3['被保人生日 年/月/日'].astype(str) + '_' + policy3['被保人性別']
+
+# 2. 建立：客戶 -> 最早交易日的查詢表
+policy_key_date = (
+    policy3.sort_values('投保日 年/月/日')  # 先排序
+    .drop_duplicates('姓名生日性別key', keep='first')  # 保留最早投保日
+    .set_index('姓名生日性別key')['投保日 年/月/日']
+    .to_dict()
+)
+
+# 3. 判斷是否為保戶
+def is_existing_customer(row):
+    key = row['姓名生日性別key']
+    trade_date = policy_key_date.get(key)
+    if pd.notnull(trade_date) and trade_date < row['簽約日 年/月/日']:
+        return 1
+    return 0
+
+# 4. 套用判斷
+agent2['成為業務前是否為保戶'] = agent2.apply(is_existing_customer, axis=1)
+
+# 只保留需要的欄位
+agent_key = (
+    agent2[['姓名生日性別key', '簽約日 年/月/日', '成為業務前是否為保戶']]
+    .drop_duplicates(subset='姓名生日性別key')
+)
+
+# 合併簽約日到保單資料
+policy_agent = policy3.merge(agent_key, on='姓名生日性別key', how='inner')
+
+# 篩選簽約日前的保單
+policy_before = policy_agent[policy_agent['投保日 年/月/日'] < policy_agent['簽約日 年/月/日']].copy()
+
+
+# 計算每位業務在簽約前的保費與保單種類
+summary = (
+    policy_before.groupby('姓名生日性別key')
+    .agg(
+        成為業務前是否為保戶=('成為業務前是否為保戶', 'first'),
+        簽約日=('簽約日 年/月/日', 'first'), 
+        累積保費=('繳款保費new', 'sum'),
+        累積受理件數=('受理件數', 'sum')
+    )
+    .reset_index()
+)
+
+
+df4['生日 年/月/日'] = pd.to_datetime(df4['生日 年/月/日'], format='%Y%m%d', errors='coerce')  
+df4['姓名生日性別key'] = df4['客戶姓名'].astype(str) + '_' + df4['生日 年/月/日'].astype(str) + '_' + df4['性別']
+
+# 合併，summary 的姓名生日key 對應到 df4 的 客戶姓名生日key
+df5 = df4.merge(
+    summary,
+    on='姓名生日性別key',
+    how='left',
+    suffixes=('', '_簽約前')
+)
+
+df5['客戶簽約時年齡'] = (
+    ((df5['簽約日'] - df5['生日 年/月/日']).dt.days // 365)
+    .where(df5['簽約日'].notna())
+)
+
+# 若簽約前的精準值有資料，則取代原本欄位
+df5['累積保費'] = df5['累積保費'].combine_first(df5['繳款保費new'])
+df5['累積受理件數'] = df5['累積受理件數'].combine_first(df5['受理件數'])
+
+# 刪除多餘欄位
+df5.drop(columns=['繳款保費new', '受理件數'], inplace=True)
+
+
+df5['是否有效拜訪'] = (
+    (df5['成為業務前是否為保戶'] == 1) &
+    (df5['簽約日'] >= df5['拜訪時間 年/月/日'])
+).astype(int)
+
 # %% 有意義的詞數
 from gensim.models import Word2Vec
 
@@ -551,16 +642,17 @@ keep_cols = [
     '營業單位', '營業單位代碼', '業代', '客戶UUID', '拜訪紀錄UUID', '拜訪時間 年/月/日', '拜訪備註',
     '拜訪次數', '平均每客戶拜訪次數', '(增)拜訪目的', '方式', '業務員', '簽約日 年/月/日', '最新職級',
     '業務目前年齡', '業務性別', '業務生日', '目前年資', '晉升日', '距離晉升天數', '歷年新增業務數',
-    '歷年準增數', '客戶姓名', '性別', '生日 年/月/日', '客戶類型', '受理件數', '繳款保費new',
-    '客戶生日', '客戶是否為業務', '是否有效拜訪', '客戶業務年齡差距', '業務客戶性別組合', 
-    '距離_km', '(增)拜訪目的', '方式', 
-    '斷詞結果', '增員語意詞數', '備註字數'
+    '歷年準增數', '客戶姓名', '性別', '客戶生日', '客戶類型', 
+    '客戶是否為業務', '是否有效拜訪', '客戶業務年齡差距', '業務客戶性別組合', 
+    '距離_km', '成為業務前是否為保戶', 
+    '簽約日', '累積保費', '累積受理件數', '客戶簽約時年齡', 
+    '備註_清理', '斷詞結果', '增員語意詞數', '備註字數'
 ]
 
 df_cleaned = df_drop[keep_cols].copy()
 
-df_cleaned[['距離晉升天數', '受理件數', '繳款保費new']] = df_cleaned[[
-    '距離晉升天數', '受理件數', '繳款保費new']].fillna(0)
+df_cleaned[['累積保費', '累積受理件數']] = df_cleaned[[
+    '累積保費', '累積受理件數']].fillna(0)
 # df_drop[['對應業務簽約日', '合終日期 年/月/日', '晉升日期_dt', '拜訪備註', 
 #      '客戶姓名', '客戶姓名生日key', ]] = df_drop[[
 #          '對應業務簽約日', '合終日期 年/月/日', '晉升日期_dt', '拜訪備註', 
@@ -570,17 +662,17 @@ missing_report = df_cleaned.isna().sum()
 missing_report = missing_report[missing_report > 0].sort_values(ascending=False)
 
 
-# 篩選 2024/1/1 ~ 2024/12/31 的筆數
-df_filtered = df_cleaned[
-    ((df_drop['拜訪時間 年/月/日'] >= pd.Timestamp('2024-01-01')) & (df_drop['拜訪時間 年/月/日'] <= pd.Timestamp('2024-12-31')))
-]
+# # 篩選 2024/1/1 ~ 2024/12/31 的筆數
+# df_filtered = df_cleaned[
+#     ((df_cleaned['拜訪時間 年/月/日'] >= pd.Timestamp('2024-01-01')) & (df_cleaned['拜訪時間 年/月/日'] <= pd.Timestamp('2024-12-31')))
+# ]
 
-df_filtered_1 = df_filtered[df_filtered['平均每客戶拜訪次數'] > 4]
+df_filtered_1 = df_cleaned[df_cleaned['平均每客戶拜訪次數'] > 4]
 
-invalid_visits = df_new[
-    (df_new['客戶是否為業務'] == 1) &
-    (df_new['簽約日'] < df_new['拜訪時間 年/月/日'])
-]
+# invalid_visits = df_new[
+#     (df_new['客戶是否為業務'] == 1) &
+#     (df_new['簽約日'] < df_new['拜訪時間 年/月/日'])
+# ]
 
 unit_stats = df_filtered_1.groupby('營業單位').agg(
     業務員數=('業代', 'nunique'),
@@ -607,9 +699,9 @@ groups = df_filtered_1['客戶UUID']  # 分群欄位：同一位潛在業務員�
 
 # ===== 2. 數值特徵欄位 =====
 numerical_cols = [
-    '平均每客戶拜訪次數', '目前年資', '距離晉升天數', '最新職級', 
-    '備註字數', '增員語意詞數', '受理件數', 
-    '繳款保費new', '客戶業務年齡差距', '業務客戶性別組合', '距離_km'
+    '拜訪次數', '平均每客戶拜訪次數', '目前年資', '距離晉升天數', '最新職級', 
+    '備註字數', '增員語意詞數', '累積受理件數', '客戶簽約時年齡', 
+    '累積保費', '客戶業務年齡差距', '業務客戶性別組合', '距離_km'
 ]
 
 X_num = df_filtered_1[numerical_cols].fillna(0)
@@ -646,6 +738,327 @@ X_combined = np.hstack([
     X_num_scaled,          # 標準化後數值欄位
     df_cat_encoded.values  # One-hot 類別欄位
 ])
+
+
+# 沒切分客戶uuid
+from sklearn.model_selection import StratifiedKFold
+
+# 資料切分
+X_trainval, X_test, y_trainval, y_test = train_test_split(
+    X_combined,
+    y,
+    test_size=0.2,
+    random_state=42,
+    stratify=y
+)
+
+# 初始化交叉驗證器（不分群）
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+roc_scores, pr_scores = [], []
+all_y_true, all_y_pred, all_y_proba = [], [], []
+
+for train_idx, val_idx in skf.split(X_trainval, y_trainval):
+    X_train, X_val = X_trainval[train_idx], X_trainval[val_idx]
+    y_train, y_val = y_trainval.iloc[train_idx], y_trainval.iloc[val_idx]
+
+    scale_ratio = y_train.value_counts()[0] / y_train.value_counts()[1]
+    model = XGBClassifier(scale_pos_weight=scale_ratio, use_label_encoder=False, eval_metric='logloss', random_state=42)
+    model.fit(X_train, y_train)
+
+    y_proba = model.predict_proba(X_val)[:, 1]
+    y_pred = (y_proba >= 0.6).astype(int)
+
+    roc_scores.append(roc_auc_score(y_val, y_proba))
+    pr_scores.append(average_precision_score(y_val, y_proba))
+    all_y_true.extend(y_val)
+    all_y_pred.extend(y_pred)
+    all_y_proba.extend(y_proba)
+
+# ===== 3. 報告交叉驗證結果 =====
+print("\n📊 Cross-Validation (Train Set, Grouped by 客戶UUID)")
+print(classification_report(all_y_true, all_y_pred))
+print(f"Average ROC AUC: {np.mean(roc_scores):.4f}")
+print(f"Average PR AUC : {np.mean(pr_scores):.4f}")
+
+
+# ===== Hold-out 測試集評估 =====
+final_model = XGBClassifier(scale_pos_weight=scale_ratio, use_label_encoder=False, eval_metric='logloss', random_state=42)
+final_model.fit(X_trainval, y_trainval)
+
+y_test_proba = final_model.predict_proba(X_test)[:, 1]
+y_test_pred = (y_test_proba >= 0.6).astype(int)
+
+print("\n🧪 Final Evaluation on Hold-out Test Set")
+print(classification_report(y_test, y_test_pred))
+print(f"ROC AUC: {roc_auc_score(y_test, y_test_proba):.4f}")
+print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
+
+# ===================================================
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.model_selection import train_test_split, StratifiedKFold, StratifiedGroupKFold
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
+from xgboost import XGBClassifier
+from gensim.models import Word2Vec
+
+# ===== 1. 準備基本資料 =====
+y = df_filtered_1['是否有效拜訪']
+groups = df_filtered_1['客戶UUID']  # 分群欄位
+
+# 數值特徵欄位
+numerical_cols = [
+    '拜訪次數', '平均每客戶拜訪次數', '目前年資', '距離晉升天數', '最新職級', 
+    '備註字數', '增員語意詞數', '累積受理件數', '客戶簽約時年齡', 
+    '累積保費', '客戶業務年齡差距', '業務客戶性別組合', '距離_km'
+]
+
+# 類別特徵欄位
+categorical_cols = ['(增)拜訪目的', '方式']
+
+# ===== 2. 先進行資料切分（修正資料洩漏） =====
+print("🔄 進行資料切分...")
+
+# 準備完整特徵資料用於切分
+feature_data = df_filtered_1[numerical_cols + categorical_cols + ['斷詞結果', '客戶UUID']].copy()
+
+# 使用 StratifiedGroupKFold 的邏輯來切分，避免同一客戶在訓練和測試集
+# 但這裡先用簡單的 train_test_split，你可以根據需要調整
+X_temp_trainval, X_temp_test, y_trainval, y_test, groups_trainval, groups_test = train_test_split(
+    feature_data, 
+    y, 
+    groups,
+    test_size=0.2, 
+    random_state=42, 
+    stratify=y
+)
+
+print(f"訓練+驗證集大小: {len(X_temp_trainval)}")
+print(f"測試集大小: {len(X_temp_test)}")
+print(f"訓練+驗證集正例比例: {y_trainval.mean():.4f}")
+print(f"測試集正例比例: {y_test.mean():.4f}")
+
+# ===== 3. 只使用訓練集訓練 Word2Vec 和 TF-IDF（修正資料洩漏）=====
+print("\n🤖 訓練 Word2Vec 和 TF-IDF 模型（僅使用訓練集）...")
+
+# 取得訓練集的句子
+train_sentences = X_temp_trainval['斷詞結果'].dropna().tolist()
+print(f"訓練句子數量: {len(train_sentences)}")
+
+# 訓練 Word2Vec 模型（僅使用訓練集）
+w2v_model = Word2Vec(sentences=train_sentences, vector_size=100, window=5, min_count=2)
+print(f"Word2Vec 詞彙量: {len(w2v_model.wv.key_to_index)}")
+
+# ===== 4. 建立 TF-IDF 權重字典（僅使用訓練集）=====
+def identity(x): 
+    return x
+
+tfidf = TfidfVectorizer(tokenizer=identity, preprocessor=identity, token_pattern=None)
+tfidf.fit(train_sentences)
+tfidf_dict = dict(zip(tfidf.get_feature_names_out(), tfidf.idf_))
+print(f"TF-IDF 詞彙量: {len(tfidf_dict)}")
+
+# ===== 5. 加權平均詞向量函數 =====
+def vectorize_sentence_weighted(sentence):
+    """使用 TF-IDF 加權的詞向量平均"""
+    # 處理各種空值情況
+    if sentence is None:
+        return np.zeros(w2v_model.vector_size)
+    
+    # 如果是 pandas Series 或其他類型，先檢查是否為 NaN
+    try:
+        if pd.isna(sentence):
+            return np.zeros(w2v_model.vector_size)
+    except (TypeError, ValueError):
+        pass
+    
+    # 如果是空列表或空字符串
+    if isinstance(sentence, (list, tuple)) and len(sentence) == 0:
+        return np.zeros(w2v_model.vector_size)
+    
+    if isinstance(sentence, str) and sentence == '':
+        return np.zeros(w2v_model.vector_size)
+    
+    # 確保 sentence 是可迭代的
+    if not hasattr(sentence, '__iter__') or isinstance(sentence, str):
+        return np.zeros(w2v_model.vector_size)
+    
+    vecs, weights = [], []
+    try:
+        for word in sentence:
+            if isinstance(word, str) and word in w2v_model.wv and word in tfidf_dict:
+                vecs.append(w2v_model.wv[word] * tfidf_dict[word])
+                weights.append(tfidf_dict[word])
+    except (TypeError, ValueError):
+        return np.zeros(w2v_model.vector_size)
+    
+    if vecs:
+        return np.sum(vecs, axis=0) / np.sum(weights)
+    else:
+        return np.zeros(w2v_model.vector_size)
+
+# ===== 6. 分別處理訓練集和測試集特徵 =====
+print("\n🔧 處理特徵...")
+
+# 6.1 處理數值特徵（訓練集）
+X_num_trainval = X_temp_trainval[numerical_cols].fillna(0)
+scaler = StandardScaler()
+X_num_trainval_scaled = scaler.fit_transform(X_num_trainval)
+
+# 6.2 處理數值特徵（測試集）- 使用訓練集的 scaler
+X_num_test = X_temp_test[numerical_cols].fillna(0)
+X_num_test_scaled = scaler.transform(X_num_test)  # 注意這裡是 transform，不是 fit_transform
+
+# 6.3 處理類別特徵（訓練集）
+df_cat_trainval = pd.get_dummies(X_temp_trainval[categorical_cols])
+print(f"類別特徵維度: {df_cat_trainval.shape[1]}")
+
+# 6.4 處理類別特徵（測試集）- 確保欄位一致
+df_cat_test = pd.get_dummies(X_temp_test[categorical_cols])
+# 確保測試集有相同的欄位
+for col in df_cat_trainval.columns:
+    if col not in df_cat_test.columns:
+        df_cat_test[col] = 0
+df_cat_test = df_cat_test[df_cat_trainval.columns]  # 保持欄位順序一致
+
+# 6.5 處理 Word2Vec 特徵
+print("處理 Word2Vec 特徵...")
+
+# 安全地處理訓練集的詞向量
+print("  處理訓練集詞向量...")
+X_w2v_trainval = []
+for i, sentence in enumerate(X_temp_trainval['斷詞結果']):
+    if i % 1000 == 0:
+        print(f"    處理進度: {i}/{len(X_temp_trainval)}")
+    vector = vectorize_sentence_weighted(sentence)
+    X_w2v_trainval.append(vector)
+X_w2v_trainval = np.array(X_w2v_trainval)
+
+# 安全地處理測試集的詞向量
+print("  處理測試集詞向量...")
+X_w2v_test = []
+for i, sentence in enumerate(X_temp_test['斷詞結果']):
+    if i % 1000 == 0:
+        print(f"    處理進度: {i}/{len(X_temp_test)}")
+    vector = vectorize_sentence_weighted(sentence)
+    X_w2v_test.append(vector)
+X_w2v_test = np.array(X_w2v_test)
+
+print(f"Word2Vec 特徵形狀 - 訓練集: {X_w2v_trainval.shape}, 測試集: {X_w2v_test.shape}")
+
+# 6.6 組合所有特徵
+X_trainval = np.hstack([
+    X_w2v_trainval,              # TF-IDF weighted word vectors
+    X_num_trainval_scaled,       # 標準化後數值欄位
+    df_cat_trainval.values       # One-hot 類別欄位
+])
+
+X_test = np.hstack([
+    X_w2v_test,                  # TF-IDF weighted word vectors
+    X_num_test_scaled,           # 標準化後數值欄位
+    df_cat_test.values           # One-hot 類別欄位
+])
+
+print(f"最終特徵維度 - 訓練集: {X_trainval.shape}, 測試集: {X_test.shape}")
+
+# ===== 7. 交叉驗證（在訓練+驗證集上）=====
+print("\n📊 開始交叉驗證...")
+
+# 選擇交叉驗證策略
+# 選項1: 不考慮客戶分群
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+cv_splits = skf.split(X_trainval, y_trainval)
+
+# 選項2: 考慮客戶分群（取消註解使用）
+# sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+# cv_splits = sgkf.split(X_trainval, y_trainval, groups_trainval)
+
+roc_scores, pr_scores = [], []
+all_y_true, all_y_pred, all_y_proba = [], [], []
+
+for fold, (train_idx, val_idx) in enumerate(cv_splits, 1):
+    print(f"  處理第 {fold} 折...")
+    
+    X_train, X_val = X_trainval[train_idx], X_trainval[val_idx]
+    y_train, y_val = y_trainval.iloc[train_idx], y_trainval.iloc[val_idx]
+    
+    # 計算類別權重
+    scale_ratio = y_train.value_counts()[0] / y_train.value_counts()[1]
+    
+    # 訓練模型
+    model = XGBClassifier(
+        scale_pos_weight=scale_ratio, 
+        use_label_encoder=False, 
+        eval_metric='logloss', 
+        random_state=42
+    )
+    model.fit(X_train, y_train)
+    
+    # 預測
+    y_proba = model.predict_proba(X_val)[:, 1]
+    y_pred = (y_proba >= 0.6).astype(int)
+    
+    # 記錄結果
+    roc_scores.append(roc_auc_score(y_val, y_proba))
+    pr_scores.append(average_precision_score(y_val, y_proba))
+    all_y_true.extend(y_val)
+    all_y_pred.extend(y_pred)
+    all_y_proba.extend(y_proba)
+
+# ===== 8. 報告交叉驗證結果 =====
+print("\n📊 Cross-Validation Results")
+print("=" * 50)
+print(classification_report(all_y_true, all_y_pred))
+print(f"Average ROC AUC: {np.mean(roc_scores):.4f} (±{np.std(roc_scores):.4f})")
+print(f"Average PR AUC : {np.mean(pr_scores):.4f} (±{np.std(pr_scores):.4f})")
+
+# ===== 9. 最終模型訓練與測試集評估 =====
+print("\n🧪 最終模型評估...")
+
+# 計算最終的類別權重
+final_scale_ratio = y_trainval.value_counts()[0] / y_trainval.value_counts()[1]
+
+# 訓練最終模型
+final_model = XGBClassifier(
+    scale_pos_weight=final_scale_ratio, 
+    use_label_encoder=False, 
+    eval_metric='logloss', 
+    random_state=42
+)
+final_model.fit(X_trainval, y_trainval)
+
+# 在測試集上預測
+y_test_proba = final_model.predict_proba(X_test)[:, 1]
+y_test_pred = (y_test_proba >= 0.6).astype(int)
+
+# ===== 10. 最終結果報告 =====
+print("\n🎯 Final Evaluation on Hold-out Test Set")
+print("=" * 50)
+print(classification_report(y_test, y_test_pred))
+print(f"ROC AUC: {roc_auc_score(y_test, y_test_proba):.4f}")
+print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
+
+# ===== 11. 特徵重要性分析 =====
+print("\n🔍 Top 10 Feature Importances:")
+feature_names = (
+    [f'w2v_{i}' for i in range(100)] +  # Word2Vec features
+    numerical_cols +                     # Numerical features  
+    list(df_cat_trainval.columns)       # Categorical features
+)
+
+importances = final_model.feature_importances_
+feature_importance_df = pd.DataFrame({
+    'feature': feature_names,
+    'importance': importances
+}).sort_values('importance', ascending=False)
+
+print(feature_importance_df.head(10).to_string(index=False))
+
+print("\n✅ 模型訓練與評估完成！")
+print("注意：此版本已修正資料洩漏問題，結果應該更真實可靠。")
+
 
 # ===================================================
 # Step 1: 取得每位客戶的唯一 ID
@@ -691,62 +1104,6 @@ for train_idx, val_idx in sgkf.split(X_trainval, y_trainval, groups=groups[train
     all_y_true.extend(y_val)
     all_y_pred.extend(y_pred)
     all_y_proba.extend(y_proba)
-
-# ===== 3. 報告交叉驗證結果 =====
-print("\n📊 Cross-Validation (Train Set, Grouped by 客戶UUID)")
-print(classification_report(all_y_true, all_y_pred))
-print(f"Average ROC AUC: {np.mean(roc_scores):.4f}")
-print(f"Average PR AUC : {np.mean(pr_scores):.4f}")
-
-
-# ===== Hold-out 測試集評估 =====
-final_model = XGBClassifier(scale_pos_weight=scale_ratio, use_label_encoder=False, eval_metric='logloss', random_state=42)
-final_model.fit(X_trainval, y_trainval)
-
-y_test_proba = final_model.predict_proba(X_test)[:, 1]
-y_test_pred = (y_test_proba >= 0.6).astype(int)
-
-print("\n🧪 Final Evaluation on Hold-out Test Set")
-print(classification_report(y_test, y_test_pred))
-print(f"ROC AUC: {roc_auc_score(y_test, y_test_proba):.4f}")
-print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
-
-
-# 沒切分客戶uuid
-from sklearn.model_selection import StratifiedKFold
-
-# 資料切分
-X_trainval, X_test, y_trainval, y_test = train_test_split(
-    X_combined,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
-)
-
-# 初始化交叉驗證器（不分群）
-skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-
-roc_scores, pr_scores = [], []
-all_y_true, all_y_pred, all_y_proba = [], [], []
-
-for train_idx, val_idx in skf.split(X_trainval, y_trainval):
-    X_train, X_val = X_trainval[train_idx], X_trainval[val_idx]
-    y_train, y_val = y_trainval.iloc[train_idx], y_trainval.iloc[val_idx]
-
-    scale_ratio = y_train.value_counts()[0] / y_train.value_counts()[1]
-    model = XGBClassifier(scale_pos_weight=scale_ratio, use_label_encoder=False, eval_metric='logloss', random_state=42)
-    model.fit(X_train, y_train)
-
-    y_proba = model.predict_proba(X_val)[:, 1]
-    y_pred = (y_proba >= 0.6).astype(int)
-
-    roc_scores.append(roc_auc_score(y_val, y_proba))
-    pr_scores.append(average_precision_score(y_val, y_proba))
-    all_y_true.extend(y_val)
-    all_y_pred.extend(y_pred)
-    all_y_proba.extend(y_proba)
-
 
 
 
@@ -1206,7 +1563,7 @@ df5['客戶簽約時年齡'] = (
 )
 
 
-# Plot
+# %% Plot
 import seaborn as sns
 
 # 設定風格

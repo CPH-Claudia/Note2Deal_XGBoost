@@ -6,6 +6,7 @@ Created on Wed Jun 11 10:48:44 2025
 """
 # %% combine 
 import pandas as pd
+import numpy as np
 
 # visit
 visit = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="visit") 
@@ -485,6 +486,8 @@ def extract_and_segment_notes(df, note_column='拜訪備註', ckip_model_path='.
 df4 = extract_and_segment_notes(df4, note_column='拜訪備註', ckip_model_path='./data')
 
 # %% 新進業務員是否為保戶
+from sklearn.preprocessing import LabelEncoder
+
 # 篩選簽約日在 2020/1/1 ~ 2024/12/31 之間的新進業務
 agent2 = pd.read_excel("D:/增員/tableau_增員.xlsx", sheet_name="agent2") 
 # 確保兩欄都是 datetime 格式
@@ -566,13 +569,52 @@ df5['客戶簽約時年齡'] = (
 df5['累積保費'] = df5['累積保費'].combine_first(df5['繳款保費new'])
 df5['累積受理件數'] = df5['累積受理件數'].combine_first(df5['受理件數'])
 
+# 確保日期格式正確
+df5['拜訪時間 年/月/日'] = pd.to_datetime(df5['拜訪時間 年/月/日'], errors='coerce')
+df5['簽約日'] = pd.to_datetime(df5['簽約日'], errors='coerce')
+
+# 計算每位客戶的第一次拜訪日
+first_visit = (
+    df5.groupby('客戶UUID', as_index=False)['拜訪時間 年/月/日']
+    .min()
+    .rename(columns={'拜訪時間 年/月/日': '第一次拜訪日'})
+)
+
+# 合併第一次拜訪日到 df5
+df5 = df5.merge(first_visit, on='客戶UUID', how='left')
+
+# 計算時長
+today = pd.Timestamp('today').normalize()  # 取今天日期（不含時間）
+
+df5['拜訪到簽約天數'] = np.where(
+    df5['簽約日'].notna(),
+    (df5['簽約日'] - df5['第一次拜訪日']).dt.days,
+    (today - df5['第一次拜訪日']).dt.days
+)
+
+purp_stage = {'(增)增援接觸': 0, '(增)約訪': 1, '(增)面談': 2, '(增)主管面談': 3, '(增)簽約': 4}
+df5['拜訪目的'] = df5['(增)拜訪目的'].map(purp_stage).fillna(-1)
+
+# 2.2 方式 Label Encoding
+le = LabelEncoder()
+df5['方式_num'] = le.fit_transform(df5['方式'].astype(str))
+
 # 刪除多餘欄位
 df5.drop(columns=['繳款保費new', '受理件數'], inplace=True)
 
 
-df5['是否有效拜訪'] = (
-    (df5['成為業務前是否為保戶'] == 1) &
-    (df5['簽約日'] >= df5['拜訪時間 年/月/日'])
+
+
+df5_filtered = df5[
+    ~(
+        (df5['成為業務前是否為保戶'] == 1) & 
+        (df5['拜訪時間 年/月/日'] > df5['簽約日'])
+    )
+].copy()
+
+df5_filtered['是否有效拜訪'] = (
+    (df5_filtered['成為業務前是否為保戶'] == 1) &
+    (df5_filtered['簽約日'] >= df5_filtered['拜訪時間 年/月/日'])
 ).astype(int)
 
 # %% 有意義的詞數
@@ -632,7 +674,7 @@ def extract_recruit_features_from_tokenlist(df,
 
     return df, recruit_words_set
 
-df_new, recruit_words = extract_recruit_features_from_tokenlist(df5)
+df_new, recruit_words = extract_recruit_features_from_tokenlist(df5_filtered)
 
 # %% filter 
 # 缺失值處理
@@ -643,8 +685,8 @@ keep_cols = [
     '拜訪次數', '平均每客戶拜訪次數', '(增)拜訪目的', '方式', '業務員', '簽約日 年/月/日', '最新職級',
     '業務目前年齡', '業務性別', '業務生日', '目前年資', '晉升日', '距離晉升天數', '歷年新增業務數',
     '歷年準增數', '客戶姓名', '性別', '客戶生日', '客戶類型', 
-    '客戶是否為業務', '是否有效拜訪', '客戶業務年齡差距', '業務客戶性別組合', 
-    '距離_km', '成為業務前是否為保戶', 
+    '是否有效拜訪', '客戶業務年齡差距', '業務客戶性別組合', 
+    '距離_km', '成為業務前是否為保戶', '拜訪到簽約天數', '拜訪目的', '方式_num',
     '簽約日', '累積保費', '累積受理件數', '客戶簽約時年齡', 
     '備註_清理', '斷詞結果', '增員語意詞數', '備註字數'
 ]
@@ -679,11 +721,9 @@ unit_stats = df_filtered_1.groupby('營業單位').agg(
     客戶數=('客戶UUID', 'nunique'),
     拜訪次數=('拜訪紀錄UUID', 'nunique')
 ).reset_index()
-
+# 業務數: 411 / 客戶數: 4852
 
 # %% model-xgboost
-import numpy as np
-import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.model_selection import train_test_split, StratifiedGroupKFold
 from sklearn.preprocessing import StandardScaler
@@ -697,47 +737,67 @@ describe = df_filtered_1.describe()
 y = df_filtered_1['是否有效拜訪']
 groups = df_filtered_1['客戶UUID']  # 分群欄位：同一位潛在業務員的拜訪紀錄歸為一群
 
-# ===== 2. 數值特徵欄位 =====
-numerical_cols = [
-    '拜訪次數', '平均每客戶拜訪次數', '目前年資', '距離晉升天數', '最新職級', 
-    '備註字數', '增員語意詞數', '累積受理件數', '客戶簽約時年齡', 
-    '累積保費', '客戶業務年齡差距', '業務客戶性別組合', '距離_km'
+
+# 1. 數值特徵
+# 需要標準化的欄位
+cols_to_scale = [
+    '拜訪次數', '平均每客戶拜訪次數', '目前年資', '距離晉升天數',
+    '備註字數', '增員語意詞數', '累積受理件數', '拜訪到簽約天數', # '客戶簽約時年齡', 
+    '累積保費', '客戶業務年齡差距', '距離_km'
 ]
 
-X_num = df_filtered_1[numerical_cols].fillna(0)
-X_num_scaled = StandardScaler().fit_transform(X_num)
+# 不標準化欄位
+cols_not_scale = ['最新職級', '業務客戶性別組合']
 
-# categoriacal & ordinal variables
-categorical_cols = ['(增)拜訪目的', '方式']
-df_cat_encoded = pd.get_dummies(df_filtered_1[categorical_cols])
+# 分開處理
+scaler = StandardScaler()
+X_scaled_part = scaler.fit_transform(df_filtered_1[cols_to_scale])
+X_not_scaled_part = df_filtered_1[cols_not_scale].values
 
-# ===== 3. 建立 Word2Vec 模型與 TF-IDF 加權 =====
+# 組合完整數值特徵
+X_num_final = np.hstack([X_scaled_part, X_not_scaled_part])
+
+# 2. 類別特徵
+# 2.1 拜訪目的映射
+purp_stage = {'(增)增援接觸': 0, '(增)約訪': 1, '(增)面談': 2, '(增)主管面談': 3, '(增)簽約': 4}
+df_filtered_1['拜訪目的_num'] = df_filtered_1['(增)拜訪目的'].map(purp_stage).fillna(-1)
+
+# 2.2 方式 Label Encoding
+le = LabelEncoder()
+df_filtered_1['方式_num'] = le.fit_transform(df_filtered_1['方式'].astype(str))
+
+X_cat = df_filtered_1[['拜訪目的_num', '方式_num']].fillna(-1).values
+
+# 3. Word2Vec + TF-IDF 加權詞向量
 sentences = df_filtered_1['斷詞結果'].dropna().tolist()
+
 w2v_model = Word2Vec(sentences=sentences, vector_size=100, window=5, min_count=2)
 
-# 建立 TF-IDF 權重字典
-def identity(x): return x
-tfidf = TfidfVectorizer(tokenizer=identity, preprocessor=identity, token_pattern=None)
+tfidf = TfidfVectorizer(tokenizer=lambda x: x, preprocessor=lambda x: x, token_pattern=None)
 tfidf.fit(sentences)
 tfidf_dict = dict(zip(tfidf.get_feature_names_out(), tfidf.idf_))
 
-# 加權平均詞向量
 def vectorize_sentence_weighted(sentence):
-    vecs, weights = [], []
-    for word in sentence:
-        if word in w2v_model.wv and word in tfidf_dict:
-            vecs.append(w2v_model.wv[word] * tfidf_dict[word])
-            weights.append(tfidf_dict[word])
-    return np.sum(vecs, axis=0) / np.sum(weights) if vecs else np.zeros(w2v_model.vector_size)
+    if isinstance(sentence, list):
+        vecs, weights = [], []
+        for word in sentence:
+            if word in w2v_model.wv and word in tfidf_dict:
+                vecs.append(w2v_model.wv[word] * tfidf_dict[word])
+                weights.append(tfidf_dict[word])
+        return np.sum(vecs, axis=0) / np.sum(weights) if vecs else np.zeros(w2v_model.vector_size)
+    else:
+        return np.zeros(w2v_model.vector_size)
 
-X_w2v_weighted = np.array([vectorize_sentence_weighted(s) for s in df_filtered_1['斷詞結果']])
+X_w2v_weighted = np.vstack(df_filtered_1['斷詞結果'].apply(vectorize_sentence_weighted))
 
-# Step 3: 組合數值 + one-hot + Word2Vec 向量
+# 4. 組合所有特徵
 X_combined = np.hstack([
-    X_w2v_weighted,        # TF-IDF weighted word vectors
-    X_num_scaled,          # 標準化後數值欄位
-    df_cat_encoded.values  # One-hot 類別欄位
+    X_w2v_weighted,  # 100維
+    X_num_final,    # 數值欄位
+    X_cat            # 類別欄位
 ])
+
+print(f'最終特徵矩陣形狀：{X_combined.shape}')
 
 
 # 沒切分客戶uuid
@@ -794,38 +854,42 @@ print(classification_report(y_test, y_test_pred))
 print(f"ROC AUC: {roc_auc_score(y_test, y_test_proba):.4f}")
 print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
 
+
+
+
+
+
 # ===================================================
-import numpy as np
-import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import train_test_split, StratifiedKFold, StratifiedGroupKFold
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
-from xgboost import XGBClassifier
 from gensim.models import Word2Vec
 
-# ===== 1. 準備基本資料 =====
+# ===== 1. 基本欄位設定 =====
 y = df_filtered_1['是否有效拜訪']
 groups = df_filtered_1['客戶UUID']  # 分群欄位
 
-# 數值特徵欄位
 numerical_cols = [
     '拜訪次數', '平均每客戶拜訪次數', '目前年資', '距離晉升天數', '最新職級', 
     '備註字數', '增員語意詞數', '累積受理件數', '客戶簽約時年齡', 
-    '累積保費', '客戶業務年齡差距', '業務客戶性別組合', '距離_km'
+    '累積保費', '客戶業務年齡差距', '業務客戶性別組合', '距離_km', 
+    '拜訪目的', '方式_num'
 ]
 
-# 類別特徵欄位
-categorical_cols = ['(增)拜訪目的', '方式']
+categorical_cols = []
 
-# ===== 2. 先進行資料切分（修正資料洩漏） =====
-print("🔄 進行資料切分...")
+# ===== 2. 區分標準化與否的數值欄位 =====
+cols_to_scale = [
+    '拜訪次數', '平均每客戶拜訪次數', '目前年資', '距離晉升天數',
+    '備註字數', '增員語意詞數', '累積受理件數', '累積保費',
+    '客戶業務年齡差距', '距離_km'
+]
 
-# 準備完整特徵資料用於切分
+cols_no_scale = ['最新職級', '客戶簽約時年齡', '業務客戶性別組合']
+
+# ===== 3. 切分資料 =====
 feature_data = df_filtered_1[numerical_cols + categorical_cols + ['斷詞結果', '客戶UUID']].copy()
 
-# 使用 StratifiedGroupKFold 的邏輯來切分，避免同一客戶在訓練和測試集
-# 但這裡先用簡單的 train_test_split，你可以根據需要調整
 X_temp_trainval, X_temp_test, y_trainval, y_test, groups_trainval, groups_test = train_test_split(
     feature_data, 
     y, 
@@ -835,133 +899,73 @@ X_temp_trainval, X_temp_test, y_trainval, y_test, groups_trainval, groups_test =
     stratify=y
 )
 
-print(f"訓練+驗證集大小: {len(X_temp_trainval)}")
-print(f"測試集大小: {len(X_temp_test)}")
-print(f"訓練+驗證集正例比例: {y_trainval.mean():.4f}")
-print(f"測試集正例比例: {y_test.mean():.4f}")
-
-# ===== 3. 只使用訓練集訓練 Word2Vec 和 TF-IDF（修正資料洩漏）=====
-print("\n🤖 訓練 Word2Vec 和 TF-IDF 模型（僅使用訓練集）...")
-
-# 取得訓練集的句子
+# ===== 4. Word2Vec & TF-IDF (僅使用訓練集) =====
 train_sentences = X_temp_trainval['斷詞結果'].dropna().tolist()
-print(f"訓練句子數量: {len(train_sentences)}")
 
-# 訓練 Word2Vec 模型（僅使用訓練集）
 w2v_model = Word2Vec(sentences=train_sentences, vector_size=100, window=5, min_count=2)
-print(f"Word2Vec 詞彙量: {len(w2v_model.wv.key_to_index)}")
 
-# ===== 4. 建立 TF-IDF 權重字典（僅使用訓練集）=====
-def identity(x): 
-    return x
-
-tfidf = TfidfVectorizer(tokenizer=identity, preprocessor=identity, token_pattern=None)
+tfidf = TfidfVectorizer(tokenizer=lambda x: x, preprocessor=lambda x: x, token_pattern=None)
 tfidf.fit(train_sentences)
 tfidf_dict = dict(zip(tfidf.get_feature_names_out(), tfidf.idf_))
-print(f"TF-IDF 詞彙量: {len(tfidf_dict)}")
 
-# ===== 5. 加權平均詞向量函數 =====
 def vectorize_sentence_weighted(sentence):
-    """使用 TF-IDF 加權的詞向量平均"""
-    # 處理各種空值情況
-    if sentence is None:
+    if not isinstance(sentence, list):
         return np.zeros(w2v_model.vector_size)
-    
-    # 如果是 pandas Series 或其他類型，先檢查是否為 NaN
-    try:
-        if pd.isna(sentence):
-            return np.zeros(w2v_model.vector_size)
-    except (TypeError, ValueError):
-        pass
-    
-    # 如果是空列表或空字符串
-    if isinstance(sentence, (list, tuple)) and len(sentence) == 0:
-        return np.zeros(w2v_model.vector_size)
-    
-    if isinstance(sentence, str) and sentence == '':
-        return np.zeros(w2v_model.vector_size)
-    
-    # 確保 sentence 是可迭代的
-    if not hasattr(sentence, '__iter__') or isinstance(sentence, str):
-        return np.zeros(w2v_model.vector_size)
-    
     vecs, weights = [], []
-    try:
-        for word in sentence:
-            if isinstance(word, str) and word in w2v_model.wv and word in tfidf_dict:
-                vecs.append(w2v_model.wv[word] * tfidf_dict[word])
-                weights.append(tfidf_dict[word])
-    except (TypeError, ValueError):
-        return np.zeros(w2v_model.vector_size)
-    
+    for word in sentence:
+        if word in w2v_model.wv and word in tfidf_dict:
+            vecs.append(w2v_model.wv[word] * tfidf_dict[word])
+            weights.append(tfidf_dict[word])
     if vecs:
         return np.sum(vecs, axis=0) / np.sum(weights)
     else:
         return np.zeros(w2v_model.vector_size)
 
-# ===== 6. 分別處理訓練集和測試集特徵 =====
-print("\n🔧 處理特徵...")
+# 計算詞向量
+X_w2v_trainval = np.vstack(X_temp_trainval['斷詞結果'].apply(vectorize_sentence_weighted))
+X_w2v_test = np.vstack(X_temp_test['斷詞結果'].apply(vectorize_sentence_weighted))
 
-# 6.1 處理數值特徵（訓練集）
-X_num_trainval = X_temp_trainval[numerical_cols].fillna(0)
+# ===== 5. 數值欄位處理 =====
 scaler = StandardScaler()
-X_num_trainval_scaled = scaler.fit_transform(X_num_trainval)
 
-# 6.2 處理數值特徵（測試集）- 使用訓練集的 scaler
-X_num_test = X_temp_test[numerical_cols].fillna(0)
-X_num_test_scaled = scaler.transform(X_num_test)  # 注意這裡是 transform，不是 fit_transform
+X_num_trainval_scaled = X_temp_trainval[cols_to_scale].fillna(0)
+X_num_test_scaled = X_temp_test[cols_to_scale].fillna(0)
 
-# 6.3 處理類別特徵（訓練集）
-df_cat_trainval = pd.get_dummies(X_temp_trainval[categorical_cols])
-print(f"類別特徵維度: {df_cat_trainval.shape[1]}")
+X_num_trainval_scaled = scaler.fit_transform(X_num_trainval_scaled)
+X_num_test_scaled = scaler.transform(X_num_test_scaled)
 
-# 6.4 處理類別特徵（測試集）- 確保欄位一致
-df_cat_test = pd.get_dummies(X_temp_test[categorical_cols])
-# 確保測試集有相同的欄位
-for col in df_cat_trainval.columns:
-    if col not in df_cat_test.columns:
-        df_cat_test[col] = 0
-df_cat_test = df_cat_test[df_cat_trainval.columns]  # 保持欄位順序一致
+X_num_trainval_final = np.hstack([
+    X_num_trainval_scaled,
+    X_temp_trainval[cols_no_scale].fillna(0).values
+])
 
-# 6.5 處理 Word2Vec 特徵
-print("處理 Word2Vec 特徵...")
+X_num_test_final = np.hstack([
+    X_num_test_scaled,
+    X_temp_test[cols_no_scale].fillna(0).values
+])
 
-# 安全地處理訓練集的詞向量
-print("  處理訓練集詞向量...")
-X_w2v_trainval = []
-for i, sentence in enumerate(X_temp_trainval['斷詞結果']):
-    if i % 1000 == 0:
-        print(f"    處理進度: {i}/{len(X_temp_trainval)}")
-    vector = vectorize_sentence_weighted(sentence)
-    X_w2v_trainval.append(vector)
-X_w2v_trainval = np.array(X_w2v_trainval)
+# ===== 6. 類別欄位 One-Hot 處理 =====
+encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+encoder.fit(X_temp_trainval[categorical_cols])
 
-# 安全地處理測試集的詞向量
-print("  處理測試集詞向量...")
-X_w2v_test = []
-for i, sentence in enumerate(X_temp_test['斷詞結果']):
-    if i % 1000 == 0:
-        print(f"    處理進度: {i}/{len(X_temp_test)}")
-    vector = vectorize_sentence_weighted(sentence)
-    X_w2v_test.append(vector)
-X_w2v_test = np.array(X_w2v_test)
+df_cat_trainval = encoder.transform(X_temp_trainval[categorical_cols])
+df_cat_test = encoder.transform(X_temp_test[categorical_cols])
 
-print(f"Word2Vec 特徵形狀 - 訓練集: {X_w2v_trainval.shape}, 測試集: {X_w2v_test.shape}")
-
-# 6.6 組合所有特徵
+# ===== 7. 組合最終特徵 =====
 X_trainval = np.hstack([
-    X_w2v_trainval,              # TF-IDF weighted word vectors
-    X_num_trainval_scaled,       # 標準化後數值欄位
-    df_cat_trainval.values       # One-hot 類別欄位
+    X_w2v_trainval,              
+    X_num_trainval_final,       
+    df_cat_trainval              
 ])
 
 X_test = np.hstack([
-    X_w2v_test,                  # TF-IDF weighted word vectors
-    X_num_test_scaled,           # 標準化後數值欄位
-    df_cat_test.values           # One-hot 類別欄位
+    X_w2v_test,                  
+    X_num_test_final,           
+    df_cat_test                  
 ])
 
 print(f"最終特徵維度 - 訓練集: {X_trainval.shape}, 測試集: {X_test.shape}")
+
 
 # ===== 7. 交叉驗證（在訓練+驗證集上）=====
 print("\n📊 開始交叉驗證...")
@@ -1042,11 +1046,20 @@ print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
 
 # ===== 11. 特徵重要性分析 =====
 print("\n🔍 Top 10 Feature Importances:")
-feature_names = (
-    [f'w2v_{i}' for i in range(100)] +  # Word2Vec features
-    numerical_cols +                     # Numerical features  
-    list(df_cat_trainval.columns)       # Categorical features
-)
+# Word2Vec 特徵
+w2v_feature_names = [f'w2v_{i}' for i in range(X_w2v_trainval.shape[1])]
+
+# 數值特徵
+num_feature_names = list(X_temp_trainval[numerical_cols].columns)
+
+# 類別特徵
+if df_cat_trainval.ndim == 2:
+    cat_feature_names = [f'cat_{i}' for i in range(df_cat_trainval.shape[1])]
+else:
+    cat_feature_names = []
+
+# 最終特徵名稱
+feature_names = w2v_feature_names + num_feature_names + cat_feature_names
 
 importances = final_model.feature_importances_
 feature_importance_df = pd.DataFrame({
@@ -1056,8 +1069,7 @@ feature_importance_df = pd.DataFrame({
 
 print(feature_importance_df.head(10).to_string(index=False))
 
-print("\n✅ 模型訓練與評估完成！")
-print("注意：此版本已修正資料洩漏問題，結果應該更真實可靠。")
+
 
 
 # ===================================================

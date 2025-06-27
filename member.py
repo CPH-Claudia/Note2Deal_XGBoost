@@ -515,7 +515,14 @@ policy_key_date = (
 # 3. 判斷是否為保戶
 def is_existing_customer(row):
     key = row['姓名生日性別key']
+    
+    # 先判斷是否有這個 key
+    if key not in policy_key_date:
+        return 0
+    
     trade_date = policy_key_date.get(key)
+    
+    # 有 key 才進一步判斷日期
     if pd.notnull(trade_date) and trade_date < row['簽約日 年/月/日']:
         return 1
     return 0
@@ -860,7 +867,7 @@ print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
 
 
 # ===================================================
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.feature_extraction.text import TfidfVectorizer
 from gensim.models import Word2Vec
@@ -888,7 +895,7 @@ cols_to_scale = [
 cols_no_scale = ['最新職級', '客戶簽約時年齡', '業務客戶性別組合']
 
 # ===== 3. 切分資料 =====
-feature_data = df_filtered_1[numerical_cols + categorical_cols + ['斷詞結果', '客戶UUID']].copy()
+feature_data = df_filtered_1[numerical_cols + categorical_cols + ['斷詞結果']].copy()
 
 X_temp_trainval, X_temp_test, y_trainval, y_test, groups_trainval, groups_test = train_test_split(
     feature_data, 
@@ -945,23 +952,21 @@ X_num_test_final = np.hstack([
 ])
 
 # ===== 6. 類別欄位 One-Hot 處理 =====
-encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
-encoder.fit(X_temp_trainval[categorical_cols])
+# encoder = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+# encoder.fit(X_temp_trainval[categorical_cols])
 
-df_cat_trainval = encoder.transform(X_temp_trainval[categorical_cols])
-df_cat_test = encoder.transform(X_temp_test[categorical_cols])
+# df_cat_trainval = encoder.transform(X_temp_trainval[categorical_cols])
+# df_cat_test = encoder.transform(X_temp_test[categorical_cols])
 
 # ===== 7. 組合最終特徵 =====
 X_trainval = np.hstack([
     X_w2v_trainval,              
-    X_num_trainval_final,       
-    df_cat_trainval              
+    X_num_trainval_final         
 ])
 
 X_test = np.hstack([
     X_w2v_test,                  
-    X_num_test_final,           
-    df_cat_test                  
+    X_num_test_final             
 ])
 
 print(f"最終特徵維度 - 訓練集: {X_trainval.shape}, 測試集: {X_test.shape}")
@@ -1592,6 +1597,32 @@ mask_agent = (unique_agent['簽約日 年/月/日'] >= '2020-01-01') & (unique_a
 unique_agent_5y = unique_agent[mask_agent].copy()
 unique_agent_5y['成為業務前是否為保戶'].value_counts()
 
+# 繪製圓餅圖
+# 處理分類
+mapping = {1: '保戶', 0: '非保戶'}
+labels = unique_agent_5y['成為業務前是否為保戶'].fillna(0).map(mapping)
+
+# 計算數值
+counts = labels.value_counts()
+
+# 自定義標籤格式
+def func(pct, allvals):
+    absolute = int(pct/100. * np.sum(allvals))
+    return f'{pct:.1f}%\n({absolute}人)'
+
+# 繪圖
+plt.figure(figsize=(5, 5))
+plt.pie(
+    counts,
+    labels=counts.index,
+    autopct=lambda pct: func(pct, counts),
+    startangle=90,
+    counterclock=False,
+    wedgeprops={'edgecolor': 'white'}
+)
+plt.title('近五年新進業務員簽約前是否為保戶分布')
+plt.show()
+
 # 計算簽約年資（以今日為基準）
 unique_agent_5y['簽約年資'] = ((pd.Timestamp('today') - unique_agent_5y['簽約日 年/月/日']).dt.days / 365)
 
@@ -1680,6 +1711,71 @@ data.value_counts().plot.bar()
 plt.title(f'群體分布（是否為業務員） (n={len(data)})')
 plt.xlabel('群體')
 plt.ylabel('人數')
+plt.show()
+
+# %% plot2
+import matplotlib.pyplot as plt
+import seaborn as sns
+plt.rc('font', family = 'Microsoft JhengHei')
+plt.rcParams['axes.unicode_minus'] = False 
+
+df5['是否為保戶分類'] = df5['成為業務前是否為保戶'].fillna(0).astype(int)
+df5['是否為保戶分類_str'] = df5['是否為保戶分類'].map({0: '非保戶', 1: '保戶'})
+
+plt.figure()
+sns.kdeplot(data=df5, x='拜訪到簽約天數', hue='是否為保戶分類_str', common_norm=False, fill=True)
+plt.title('拜訪到簽約天數分布 (依簽約前是否為保戶分組)')
+plt.xlabel('拜訪到簽約天數')
+plt.ylabel('密度')
+plt.show()
+
+
+plt.figure(figsize=(12,5))
+
+plt.subplot(1,2,1)
+sns.boxplot(data=df5, x='是否為保戶分類_str', y='累積保費')
+plt.title('累積保費分布 (依簽約前是否為保戶分組)')
+
+plt.subplot(1,2,2)
+sns.boxplot(data=df5, x='是否為保戶分類_str', y='累積受理件數')
+plt.title('受理件數分布 (依簽約前是否為保戶分組)')
+
+plt.tight_layout()
+plt.show()
+
+plt.figure(figsize=(8, 5))
+sns.boxplot(data=df5, x='是否為保戶分類_str', y='距離_km')
+plt.title('距離_km分布 (依簽約前是否為保戶分組)')
+plt.show()
+
+plt.figure(figsize=(8, 5))
+sns.boxplot(data=df5, x='是否為保戶分類_str', y='客戶業務年齡差距')
+plt.title('客戶業務年齡差距分布 (依簽約前是否為保戶分組)')
+plt.show()
+
+# sex
+fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+
+
+
+# 保戶群
+df5[df5['是否為保戶分類'] == 1]['性別'].value_counts().plot.pie(
+    ax=axes[0], autopct='%1.1f%%', startangle=90, counterclock=False, 
+    wedgeprops={'edgecolor': 'white'}
+)
+axes[0].set_title('簽約前為保戶 - 性別分布')
+axes[0].set_ylabel('')
+
+# 非保戶群
+df5[df5['是否為保戶分類'] == 0]['性別'].value_counts().plot.pie(
+    ax=axes[1], autopct='%1.1f%%', startangle=90, counterclock=False, 
+    wedgeprops={'edgecolor': 'white'}
+)
+axes[1].set_title('簽約前非保戶 - 性別分布')
+axes[1].set_ylabel('')
+
+plt.tight_layout()
 plt.show()
 
 

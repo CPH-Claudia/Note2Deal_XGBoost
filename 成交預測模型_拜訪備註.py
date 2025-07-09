@@ -1605,6 +1605,7 @@ plt.show()
 
 
 # %% shap 各變數解釋
+import shap
 num_vars = [
     '平均拜訪間隔天數', '每週平均拜訪客戶數', '業務客戶年齡差距', # '拜訪紀錄密度', 
     '備註字數', '有意義詞數', 
@@ -1812,7 +1813,171 @@ def plot_shap_by_category(X_data, shap_values, feature_names, var_name, output_d
 for v in cat_vars:
     plot_shap_by_category(X_trainval, shap_values, final_feature_names, v, output_dir) # 
     
+# %% 訓練集正向貢獻區間
+summary_list = []
+
+for var in num_vars:
+    try:
+        idx = final_feature_names.index(var)
+        x = X_trainval[:, idx]
+        shap_val = shap_values[:, idx].values
+
+        df = pd.DataFrame({"值": x, "SHAP": shap_val}).sort_values("值").reset_index(drop=True)
+        df["SHAP_smooth"] = df["SHAP"].rolling(window=20, min_periods=1).mean()
+
+        df["is_neg"] = (df["SHAP_smooth"] < 0).astype(int)
+        df["neg_group"] = (df["is_neg"].diff(1) != 0).cumsum()
+        neg_segments = df[df["is_neg"] == 1].groupby("neg_group")
+        neg_ranges = [(seg["值"].min(), seg["值"].max()) for _, seg in neg_segments]
+
+        value_min, value_max = df["值"].min(), df["值"].max()
+        positive_ranges = []
+        current_start = value_min
+        for neg_start, neg_end in sorted(neg_ranges):
+            if current_start < neg_start:
+                positive_ranges.append((current_start, neg_start))
+            current_start = max(current_start, neg_end)
+        if current_start < value_max:
+            positive_ranges.append((current_start, value_max))
+
+        # 還原為原始數值
+        mean, scale = mean_dict[var], scale_dict[var]
+        restored_ranges = [(lo * scale + mean, hi * scale + mean) for lo, hi in positive_ranges]
+
+        for lo_raw, hi_raw in restored_ranges:
+            summary_list.append({
+                "變數名稱": var,
+                "類別值": np.nan,
+                "區間起": lo_raw,
+                "區間迄": hi_raw,
+                "貢獻方向": "正向"
+            })
+
+    except Exception as e:
+        print(f"{var} 失敗：{e}")
+
+
+from sklearn.preprocessing import LabelEncoder
+
+def plot_shap_by_category_safe(train_df, shap_values, feature_names, var_name, output_dir):
+    try:
+        idx = feature_names.index(var_name)
+        
+        # 確保類別數值對應正確
+        le = LabelEncoder()
+        encoded_vals = le.fit_transform(train_df[var_name])
+        
+        shap_val = shap_values[:, idx].values
+
+        df = pd.DataFrame({
+            '類別值': le.inverse_transform(encoded_vals),
+            'SHAP': shap_val
+        })
+
+        shap_mean = df.groupby('類別值')['SHAP'].mean().reset_index()
+
+        plt.figure(figsize=(6, 4))
+        bars = plt.bar(shap_mean['類別值'].astype(str), shap_mean['SHAP'], color='skyblue')
+        
+        for bar in bars:
+            height = bar.get_height()
+            plt.text(
+                bar.get_x() + bar.get_width() / 2,
+                height - 0.015 if height >= 0 else height + 0.015,
+                f"{height:.2f}",
+                ha='center',
+                va='bottom' if height >= 0 else 'top',
+                fontsize=8,
+                color='black'
+            )
+            
+        plt.axhline(0, color='gray', linestyle='--')
+        plt.xlabel(var_name)
+        plt.ylabel("平均 SHAP 值")
+        plt.title(f"{var_name} 各類別對成交的平均 SHAP 貢獻")
+        plt.tight_layout()
+
+        filename = os.path.join(output_dir, f"{var_name}_shap_bar.png")
+        plt.savefig(filename, dpi=300, bbox_inches='tight')
+        plt.close()
+        print(f"✅ 已儲存：{filename}")
+
+    except Exception as e:
+        print(f"❌ {var_name} 失敗：{e}")
+
+
+
+df_summary = pd.DataFrame(summary_list)
+
+# 寬格式
+wide_df = df_summary.pivot_table(
+    index="變數名稱",
+    columns=["類別值", "貢獻方向"],
+    values=["區間起", "區間迄"],
+    aggfunc="first"
+).reset_index()
+
+# 解 MultiIndex 欄位問題
+wide_df.columns = ['_'.join([str(c) for c in col if c]) for col in wide_df.columns]
+
+# 長格式直接用 df_summary
+
+output_path = "D:/備註文字探勘/xgbmodel_貢獻區間資料.xlsx"
+with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+    proba_df.to_excel(writer, sheet_name='交叉驗證結果', index=False)
+    test_result_df.to_excel(writer, sheet_name='測試集結果', index=False)
+    wide_df.to_excel(writer, sheet_name="寬格式區間資料", index=False)
+    df_summary.to_excel(writer, sheet_name="長格式區間資料", index=False)
+
+print(f"✅ 已輸出正負向貢獻區間資料，路徑：{output_path}")
+
+
+
+
     
+# %% 輸出shap value + raw data 結果
+import pandas as pd
+import numpy as np
+import os
+
+# === 輸出路徑設定 ===
+output_path = "D:/備註文字探勘/成交預測_SHAP_完整輸出.xlsx"
+
+# === 你的資料（請替換為實際資料）===
+# combined_df：原始預測結果
+# shap_values：SHAP 解釋值 (n_samples, n_features)
+# final_feature_names：SHAP 對應的特徵名稱清單
+
+# 保險處理 SHAP 格式
+shap_array = shap_values.values if hasattr(shap_values, "values") else shap_values
+assert shap_array.shape[0] == combined_df.shape[0]
+
+# 產生寬格式 SHAP 資料
+shap_df = pd.DataFrame(shap_array, columns=[f"SHAP_{var}" for var in final_feature_names])
+
+# 合併關鍵欄位
+merged_df = pd.concat([
+    combined_df[['拜訪紀錄UUID', '客戶UUID', '業代', '預測機率', '潛力分類']],
+    shap_df
+], axis=1)
+
+# 轉為長格式
+shap_melt = merged_df.melt(
+    id_vars=['拜訪紀錄UUID', '客戶UUID', '業代', '預測機率', '潛力分類'],
+    value_vars=[f"SHAP_{var}" for var in final_feature_names],
+    var_name="變數名稱",
+    value_name="SHAP貢獻值"
+)
+shap_melt['貢獻方向'] = np.where(shap_melt['SHAP貢獻值'] >= 0, '正向貢獻', '負向貢獻')
+
+# === 輸出 Excel 檔案 ===
+with pd.ExcelWriter(output_path, engine='xlsxwriter') as writer:
+    merged_df.to_excel(writer, sheet_name='SHAP_寬格式', index=False)
+    shap_melt.to_excel(writer, sheet_name='SHAP_長格式', index=False)
+
+print(f"✅ 已同時輸出寬格式與長格式 SHAP 解釋，路徑：{output_path}")
+
+
 # %% 決策樹自動分點建議
 
 import pandas as pd

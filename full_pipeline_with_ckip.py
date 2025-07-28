@@ -13,15 +13,18 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd
 import numpy as np
 import pickle
-from ckiptagger import WS
 import os
 from datetime import datetime
 
-# === 初始化斷詞工具 ===
-ws = WS("./data")  # 指向 CKIP model 資料夾
 
 # === 斷詞 + 清理流程 ===
 def full_pipeline_with_ckip(file_path):
+    
+    from ckiptagger import WS
+
+    # === 初始化斷詞工具 ===
+    ws = WS("./data")  # 指向 CKIP model 資料夾
+
     # === Step 1: 讀取 VISIT 備註欄位進行斷詞 ===
     visit_raw = pd.read_excel(file_path, sheet_name="VISIT")
     visit_raw['拜訪時間 年/月/日'] = pd.to_datetime(visit_raw['拜訪時間 年/月/日'], errors='coerce')
@@ -116,8 +119,21 @@ def full_pipeline_with_ckip(file_path):
 
     print(f"共獲得停用詞數量（繁體）: {len(stopwords_trad)}")
 
+    # filtered_words = [
+    #     [word for word in sentence if word not in stopwords_trad and len(word) > 1]
+    #     for sentence in word_list
+    # ]
+    import re
     filtered_words = [
-        [word for word in sentence if word not in stopwords_trad and len(word) > 1]
+        [
+            word for word in sentence
+            if (
+                word not in stopwords_trad and
+                len(word) > 1 and
+                not re.fullmatch(r'[\W_]+', word) and  # 排除純符號
+                not re.fullmatch(r'\d+', word)         # 排除純數字
+            )
+        ]
         for sentence in word_list
     ]
 
@@ -132,19 +148,69 @@ def full_pipeline_with_ckip(file_path):
 
     print(f"✅ 斷詞完成，共 {len(filtered_words)} 筆，接續資料整併...")
 
+    # from sklearn.feature_extraction.text import TfidfVectorizer
+    
+    # def vectorize_hashtag_features(df, text_col='標籤_文字', prefix='hashtag_', max_features=30):
+    #     """
+    #     將 #標籤文字 欄位轉為 TF-IDF 特徵向量並合併回原 df。
+        
+    #     參數:
+    #     - df: 原始 DataFrame
+    #     - text_col: 儲存 hashtag 的欄位名稱
+    #     - prefix: 新欄位前綴字
+    #     - max_features: 限制最多多少個 TF-IDF 字詞
+    
+    #     """
+    #     df = df.copy()
+    #     df[text_col] = df[text_col].fillna('').astype(str).str.replace('_x000D_', ' ').str.replace('\n', ' ')
+    #     corpus = df[text_col].tolist()
+    
+    #     vectorizer = TfidfVectorizer(max_features=max_features, token_pattern=r'(?u)#?\b\w+\b')
+    #     tfidf_matrix = vectorizer.fit_transform(corpus)
+    #     tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=[prefix + w for w in vectorizer.get_feature_names_out()])
+    #     tfidf_df.index = df.index
+    
+    #     df_with_hashtag_vec = pd.concat([df, tfidf_df], axis=1)
+    #     return df_with_hashtag_vec
+    
+    
     # === Step 2: 清理與欄位整合 ===
     from insurance_data_clean import prepare_model_dataset
     df_ready, policy_df = prepare_model_dataset(file_path)
     print("📊 資料整併完成，樣本數：", len(df_ready))
+    
+    # === Step 1.5: 清理備註空值資料（與訓練一致）===
+    df_ready = df_ready[
+        df_ready['備註文字_處理'].notna() &
+        (df_ready['備註文字_處理'].str.strip() != '')
+    ]
+    
+    from drift_check import check_drift_and_warn
+    ref_path = "D:/備註文字探勘/models/train_reference.csv"
+    safe_to_predict = check_drift_and_warn(df_ready, ref_path, stop_if_drift=True)
+    # if not safe_to_predict:
+    #     return df_ready, policy_df  # 中止流程
+    
+    from retrain_model import retrain_and_save_model # train_model_pipeline, 
+    if not safe_to_predict:
+        print("⚠️ 偵測到資料偏移，正在重新訓練模型...")
+        # train_model_pipeline(df_ready, policy_df, save_dir="D:/備註文字探勘/models")
+        retrain_and_save_model(df_ready, policy_df, save_dir="D:/備註文字探勘/models")
 
     # === Step 3: 模型預測與輸出 ===
-    from insurance_data_clean import prepare_model_dataset
     from predict_model import predict_with_model
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     output_path = os.path.join(output_dir, f"results/預測_{timestamp}.xlsx")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     predict_with_model(df_ready, output_path, source_file=file)
+    
+    # === Step 5: 建立斷詞長格式（包含預測機率）===
+    tokens_exploded = df_ready[[
+        '客戶UUID', '拜訪紀錄UUID', '拜訪備註_詞語', '預測成交機率'
+    ]].explode('拜訪備註_詞語').rename(columns={'拜訪備註_詞語': '詞語'}).dropna(subset=['詞語'])
+
+    with pd.ExcelWriter(output_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+        tokens_exploded.to_excel(writer, index=False, sheet_name="斷詞長格式")
 
     print("✅ 模型預測完成，結果輸出：", output_path)
     return df_ready, policy_df
@@ -152,6 +218,6 @@ def full_pipeline_with_ckip(file_path):
 
 # ✅ 範例執行
 if __name__ == '__main__':
-    file = "D:/備註文字探勘/repeater/拜訪_TEST.xlsx"
+    file = "D:/備註文字探勘/repeater/新資料_0704.xlsx"
     df_ready, policy_df = full_pipeline_with_ckip(file)
     print("✅ 全流程完成，可用於預測，樣本數：", len(df_ready))

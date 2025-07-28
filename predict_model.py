@@ -6,17 +6,42 @@ Created on Fri Jun  6 09:34:53 2025
 """
 
 import pickle
+import os
 import dill
+import json
+from gensim.models import Word2Vec
+import joblib
 import numpy as np
 import pandas as pd
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, average_precision_score
 
-def load_models():
-    with open("D:/備註文字探勘/models/xgb_model_final.pkl", 'rb') as f: model = pickle.load(f)
-    with open("D:/備註文字探勘/models/word2vec_model.pkl", 'rb') as f: w2v = pickle.load(f)
-    with open("D:/備註文字探勘/models/tfidf_vectorizer.pkl", 'rb') as f: tfidf = dill.load(f, encoding='latin1')
-    with open("D:/備註文字探勘/models/scaler.pkl", 'rb') as f: scaler = pickle.load(f)
-    return model, w2v, tfidf, scaler
+# def load_models():
+#     with open("D:/備註文字探勘/models/xgb_model_final.pkl", 'rb') as f: model = pickle.load(f)
+#     with open("D:/備註文字探勘/models/word2vec_model.pkl", 'rb') as f: w2v = pickle.load(f)
+#     with open("D:/備註文字探勘/models/tfidf_vectorizer.pkl", 'rb') as f: tfidf = dill.load(f, encoding='latin1')
+#     with open("D:/備註文字探勘/models/scaler.pkl", 'rb') as f: scaler = pickle.load(f)
+#     return model, w2v, tfidf, scaler
+
+
+def load_models(model_dir="D:/備註文字探勘/models"):
+    latest_path = os.path.join(model_dir, "latest.json")
+    if not os.path.exists(latest_path):
+        raise FileNotFoundError("❌ 找不到 latest.json，請先執行模型訓練。")
+
+    with open(latest_path, "r", encoding="utf-8") as f:
+        latest = json.load(f)
+
+    model = joblib.load(os.path.join(model_dir, latest["model"]))
+    w2v_model = joblib.load(os.path.join(model_dir, latest["word2vec"]))
+    tfidf = joblib.load(os.path.join(model_dir, latest["tfidf"]))
+    scaler = joblib.load(os.path.join(model_dir, latest["scaler"]))
+    with open(os.path.join(model_dir, "final_feature_names.json"), "r", encoding="utf-8") as f: 
+        final_feature_names = json.load(f)
+    
+    
+    print(f"✅ 已載入模型版本：{latest['timestamp']}")
+    return model, w2v_model, tfidf, scaler, final_feature_names
+
 
 def classify_probability(p):
     if p >= 0.9: return "極高潛力"
@@ -76,8 +101,18 @@ def evaluate_predictions(results_path, policy_df, threshold=0.6):
 
 
 def predict_with_model(df_ready, output_path, source_file=None):
-    model, w2v_model, tfidf_vectorizer, scaler = load_models()
+    model, w2v_model, tfidf_vectorizer, scaler, final_feature_names = load_models()
 
+    # 自動補上 label（與訓練時一致：拜訪與投保日天數差 <= 30 為成交）
+    if "label" not in df_ready.columns and "拜訪與投保日天數差" in df_ready.columns:
+        df_ready["label"] = df_ready["拜訪與投保日天數差"].apply(lambda x: 1 if pd.notna(x) and x <= 30 else 0)
+
+    # # 移除備註空值或斷詞為空的筆數
+    # df_ready = df_ready[
+    #     df_ready['備註文字_處理'].notna() & 
+    #     (df_ready['備註文字_處理'].str.strip() != '')
+    # ]
+    
     # 數值特徵
     numerical_cols = [
         '業務客戶性別組合', '最新職級', '拜訪目的', 
@@ -102,18 +137,47 @@ def predict_with_model(df_ready, output_path, source_file=None):
 
     tokens_list = df_ready['拜訪備註_詞語']
     X_w2v = np.array([vectorize_sentence_weighted(x) for x in tokens_list])
+    
+    w2v_feature_names = [f"w2v_{i}" for i in range(10)]
+    num_feature_names = numerical_cols
+    X_combined_df = pd.DataFrame(np.hstack([X_w2v[:, :10], X_scaled]), columns=w2v_feature_names + num_feature_names)
+    X_combined_df = X_combined_df[final_feature_names]  # 根據訓練時的順序重新排列
+    X_combined = X_combined_df.values
 
-    # 組合後預測
-    X_combined = np.hstack([X_scaled, X_w2v[:, :10]])  # 若你只選用 Top10 維度
+
+    # 合併
+    # X_combined = np.hstack([X_scaled, X_w2v[:, :10]])
     y_pred_proba = model.predict_proba(X_combined)[:, 1]
-
     df_ready['預測成交機率'] = y_pred_proba
     df_ready['潛力分類'] = df_ready['預測成交機率'].apply(classify_probability)
+    df_ready['預測成交與否'] = (df_ready['預測成交機率'] >= 0.6).astype(int)
 
-    df_ready.to_excel(output_path, index=False)
+    # 評估報告產生
+    def generate_model_report(y_true, y_pred, y_prob):
+        report_dict = classification_report(y_true, y_pred, output_dict=True)
+        report_df = pd.DataFrame(report_dict).T
+        report_df["ROC AUC"] = roc_auc_score(y_true, y_prob)
+        report_df["PR AUC"] = average_precision_score(y_true, y_prob)
+        return report_df
+
+    # ✅ 儲存為 Excel：包含預測結果 + 模型評估
+    with pd.ExcelWriter(output_path, engine="openpyxl", mode="w") as writer:
+        df_ready.to_excel(writer, index=False, sheet_name="預測結果")
+
+        if "label" in df_ready.columns:
+            eval_df = generate_model_report(
+                df_ready["label"],
+                df_ready["預測成交與否"],
+                df_ready["預測成交機率"]
+            )
+            eval_df.to_excel(writer, sheet_name="模型評估")
+            print("✅ 評估完成，結果已寫入 Excel：", output_path)
+        else:
+            print("⚠️ 無法執行模型評估：缺少 label 欄位")
+
     print(f"✅ 預測完成，已儲存至：{output_path}")
-    
+
+    # 可選的額外評估（如你有 evaluate_predictions 函數）
     if source_file is not None:
         policy_df = pd.read_excel(source_file, sheet_name="POLICY")
         evaluate_predictions(results_path=output_path, policy_df=policy_df, threshold=0.6)
-    

@@ -28,13 +28,13 @@ plt.rcParams['axes.unicode_minus'] = False
 
 # %% 文字前處理 
 # pip install numpy==1.23 --upgrade
-visit = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", sheet_name="VISIT") 
+visit = pd.read_excel("D:/備註文字探勘/repeater/新資料_0704.xlsx", sheet_name="VISIT") 
 visit['拜訪時間'] = pd.to_datetime(visit['拜訪時間'], errors='coerce')
 
 # 篩選 2024/2/1 ~ 2024/6/30 和 2024/8/1 ~ 2024/12/31 的筆數
 visit_filtered = visit[
-    ((visit['拜訪時間'] >= pd.Timestamp('2024-02-01')) & (visit['拜訪時間'] <= pd.Timestamp('2024-06-30'))) |
-    ((visit['拜訪時間'] >= pd.Timestamp('2024-08-01')) & (visit['拜訪時間'] <= pd.Timestamp('2024-12-31')))
+    ((visit['拜訪時間'] >= pd.Timestamp('2024-02-01')) & (visit['拜訪時間'] <= pd.Timestamp('2024-12-31'))) |
+    ((visit['拜訪時間'] >= pd.Timestamp('2025-02-01')) & (visit['拜訪時間'] <= pd.Timestamp('2025-12-31')))
 ]
 
 df = visit_filtered.copy()
@@ -223,13 +223,13 @@ filtered_words = [
 # 匯出斷詞後結果
 import pickle
 
-with open('D:/備註文字探勘/filtered_words_2024.pkl', 'wb') as f:
+with open('D:/備註文字探勘/repeater/filtered_words_0704.pkl', 'wb') as f:
     pickle.dump(filtered_words, f)
     
 # %% 變更環境到 PYTHON311
 import pickle
 
-with open('D:/備註文字探勘/filtered_words_2024.pkl', 'rb') as f:
+with open('D:/備註文字探勘/repeater/filtered_words_0704.pkl', 'rb') as f:
     filtered_words = pickle.load(f)
 
 
@@ -271,21 +271,15 @@ word_freq_clean = Counter(flat_words_cleaned)
 # %% 合併資料
 # %%%% 納入成交資料
 # 再執行一次"% 文字前處理"
-tags = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", sheet_name="TAGS")
+tags = pd.read_excel("D:/備註文字探勘/repeater/新資料_0704.xlsx", sheet_name="TAGS")
 # 只保留需要的欄位，避免重複欄位影響合併
 tags_subset = tags[['拜訪紀錄UUID', '標籤名稱']]
 
 # 合併資料，若一個 UUID 對應多個標籤則會產生多列
 df = df.merge(tags_subset, on='拜訪紀錄UUID', how='left')
 
-# ceo = pd.read_excel("D:/備註文字探勘/拜訪_冬賽.xlsx", sheet_name="CEO", dtype={'業代': str})
-
-# # 新增CEO欄位（業代有在 ceo 表中）
-# df['CEO'] = df['業代'].isin(ceo['業代']).astype(int)
-# # print(df.groupby('CEO')['業代'].nunique())
-
 # %%%% 納入業務資料
-agent = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", sheet_name="AGENT", dtype={'業代': str})
+agent = pd.read_excel("D:/備註文字探勘/repeater/新資料_0704.xlsx", sheet_name="AGENT", dtype={'業代': str})
 
 agent_stage = {'CB': 0, 'JB': 1, 'PB': 2, 'SB': 3}
 agent['職級_代碼'] = agent['月結檔 | 職級'].map(agent_stage)
@@ -304,7 +298,7 @@ agent_sorted['晉升日'] = agent_sorted.where(agent_sorted['是否晉升']).gro
 last_info = agent_sorted.groupby('業代').last().reset_index()[['業代', '職級_代碼', '目前年齡', '性別', '年資']]
 
 # 2 夏賽（202403~202406）活動參與率 & FYC
-last = agent[(agent['計績年月'] >= 202303) & (agent['計績年月'] <= 202306) | 
+last = agent[(agent['計績年月'] >= 202503) & (agent['計績年月'] <= 202506) | 
             (agent['計績年月'] >= 202309) & (agent['計績年月'] <= 202312)]
 last_summary = last.groupby('業代').agg({
     '活動參與率': 'mean',
@@ -393,7 +387,7 @@ df['是否晉升'] = df.apply(
 )
 
 # %%%% 納入增員資料
-member = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", sheet_name="MEMBER", dtype={'業代': str})
+member = pd.read_excel("D:/備註文字探勘/repeater/新資料_0704.xlsx", sheet_name="MEMBER", dtype={'業代': str})
 
 # 篩選前一個賽季 + 當年度 202309~202412
 previous = member[(member['計績年月'] >= 202309) & (member['計績年月'] <= 202312) | 
@@ -436,7 +430,7 @@ df['拜訪備註_詞語'] = filtered_words_cleaned
 df['詞數'] = df['拜訪備註_詞語'].apply(lambda x: len(x) if isinstance(x, list) else 0)
 
 # %%%% 納入 customer 資料
-customer = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", sheet_name="CUSTOMER", dtype={'業代': str})
+customer = pd.read_excel("D:/備註文字探勘/repeater/新資料_0704.xlsx", sheet_name="CUSTOMER", dtype={'業代': str})
 customer['建立時間'] = pd.to_datetime(customer['建立時間'])
 # 篩選 2024/1/1 ~ 2024/7/31 的筆數
 customer_filtered = customer[(customer['建立時間'] >= '2023-07-01') & (customer['建立時間'] <= '2023-12-31')]
@@ -480,7 +474,7 @@ df = df.merge(customer_stats, on='業代', how='left')
 df[['上半年準客戶數', '上半年新增保戶數']] = df[['上半年準客戶數', '上半年新增保戶數']].fillna(0).astype(int)
 
 # %%%% 納入客戶資料
-info = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", sheet_name="INFO")
+info = pd.read_excel("D:/備註文字探勘/repeater/新資料_0704.xlsx", sheet_name="INFO")
 customer_summary = info.groupby('經紀人1-被保人CRM UUID').agg({
     '被保人性別': 'last', 
     '被保人目前年齡': 'last', 
@@ -513,7 +507,7 @@ df_drop = df.dropna(subset=['被保人性別', '被保人目前年齡', '要保�
 df_valid_notes = df_drop[df_drop['拜訪備註_文字'].notna()].reset_index(drop=True)
 
 
-policy = pd.read_excel("D:/備註文字探勘/拜訪_2024冬夏賽.xlsx", sheet_name="POLICY") 
+policy = pd.read_excel("D:/備註文字探勘/repeater/新資料_0704.xlsx", sheet_name="POLICY") 
 policy['是否為網路投保'] = np.where(policy['進件別'] == '網路投保', 1, 0)
 
 # 確保時間格式正確
@@ -1057,7 +1051,7 @@ X_trainval, X_test, y_trainval, y_test = train_test_split(
 
 # 轉為 DataFrame
 X_trainval_df = pd.DataFrame(X_trainval, columns=final_feature_names)
-X_trainval_df.to_csv("D:/備註文字探勘/models/train_reference.csv", index=False)
+# X_trainval_df.to_csv("D:/備註文字探勘/models/train_reference.csv", index=False)
 
 model_init = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
 model_init.fit(X_trainval, y_trainval)

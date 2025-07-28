@@ -15,32 +15,36 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, average_precision_score
 
-# def load_models():
-#     with open("D:/備註文字探勘/models/xgb_model_final.pkl", 'rb') as f: model = pickle.load(f)
-#     with open("D:/備註文字探勘/models/word2vec_model.pkl", 'rb') as f: w2v = pickle.load(f)
-#     with open("D:/備註文字探勘/models/tfidf_vectorizer.pkl", 'rb') as f: tfidf = dill.load(f, encoding='latin1')
-#     with open("D:/備註文字探勘/models/scaler.pkl", 'rb') as f: scaler = pickle.load(f)
-#     return model, w2v, tfidf, scaler
-
-
 def load_models(model_dir="D:/備註文字探勘/models"):
-    latest_path = os.path.join(model_dir, "latest.json")
-    if not os.path.exists(latest_path):
-        raise FileNotFoundError("❌ 找不到 latest.json，請先執行模型訓練。")
-
-    with open(latest_path, "r", encoding="utf-8") as f:
+    with open(os.path.join(model_dir, "latest.json"), encoding="utf-8") as f:
         latest = json.load(f)
-
     model = joblib.load(os.path.join(model_dir, latest["model"]))
     w2v_model = joblib.load(os.path.join(model_dir, latest["word2vec"]))
     tfidf = joblib.load(os.path.join(model_dir, latest["tfidf"]))
     scaler = joblib.load(os.path.join(model_dir, latest["scaler"]))
-    with open(os.path.join(model_dir, "final_feature_names.json"), "r", encoding="utf-8") as f: 
-        final_feature_names = json.load(f)
-    
-    
+    features = joblib.load(os.path.join(model_dir, latest["features"]))
     print(f"✅ 已載入模型版本：{latest['timestamp']}")
-    return model, w2v_model, tfidf, scaler, final_feature_names
+    return model, w2v_model, tfidf, scaler, features
+
+
+# def load_models(model_dir="D:/備註文字探勘/models"):
+#     latest_path = os.path.join(model_dir, "latest.json")
+#     if not os.path.exists(latest_path):
+#         raise FileNotFoundError("❌ 找不到 latest.json，請先執行模型訓練。")
+
+#     with open(latest_path, "r", encoding="utf-8") as f:
+#         latest = json.load(f)
+
+#     model = joblib.load(os.path.join(model_dir, latest["model"]))
+#     w2v_model = joblib.load(os.path.join(model_dir, latest["word2vec"]))
+#     tfidf = joblib.load(os.path.join(model_dir, latest["tfidf"]))
+#     scaler = joblib.load(os.path.join(model_dir, latest["scaler"]))
+#     with open(os.path.join(model_dir, "final_feature_names.json"), "r", encoding="utf-8") as f: 
+#         final_feature_names = json.load(f)
+    
+    
+#     print(f"✅ 已載入模型版本：{latest['timestamp']}")
+#     return model, w2v_model, tfidf, scaler, final_feature_names
 
 
 def classify_probability(p):
@@ -101,33 +105,16 @@ def evaluate_predictions(results_path, policy_df, threshold=0.6):
 
 
 def predict_with_model(df_ready, output_path, source_file=None):
-    model, w2v_model, tfidf_vectorizer, scaler, final_feature_names = load_models()
-
-    # 自動補上 label（與訓練時一致：拜訪與投保日天數差 <= 30 為成交）
-    if "label" not in df_ready.columns and "拜訪與投保日天數差" in df_ready.columns:
-        df_ready["label"] = df_ready["拜訪與投保日天數差"].apply(lambda x: 1 if pd.notna(x) and x <= 30 else 0)
-
-    # # 移除備註空值或斷詞為空的筆數
-    # df_ready = df_ready[
-    #     df_ready['備註文字_處理'].notna() & 
-    #     (df_ready['備註文字_處理'].str.strip() != '')
-    # ]
+    model, w2v_model, tfidf_vectorizer, scaler, features = load_models()
     
-    # 數值特徵
-    numerical_cols = [
-        '業務客戶性別組合', '最新職級', '拜訪目的', 
-        '平均拜訪間隔天數', '每週平均拜訪客戶數', '業務客戶年齡差距', # '拜訪紀錄密度', 
-        '備註字數', '有意義詞數', 
-        '目前年資', '營業單位_編碼', # '當年度賽季增員數', '加前一賽季增員數', '最新職級', 
-        '上半年準客戶數', '今年度活動參與率', '上年度FYC', '距離晉升天數', 
-        '件數', '總保費' # '業務客戶性別組合', 
-    ]
+    numerical_cols = [f for f in features if not f.startswith("w2v_")]
+    w2v_indices = [int(f.split("_")[1]) for f in features if f.startswith("w2v_")]
+
     X_num = df_ready[numerical_cols].fillna(0)
     X_scaled = scaler.transform(X_num)
 
-    # TF-IDF + Word2Vec 向量
+    tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
     def vectorize_sentence_weighted(sentence):
-        tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
         vecs, weights = [], []
         for word in sentence:
             if word in w2v_model.wv and word in tfidf_dict:
@@ -135,22 +122,64 @@ def predict_with_model(df_ready, output_path, source_file=None):
                 weights.append(tfidf_dict[word])
         return np.sum(vecs, axis=0) / np.sum(weights) if vecs else np.zeros(w2v_model.vector_size)
 
-    tokens_list = df_ready['拜訪備註_詞語']
-    X_w2v = np.array([vectorize_sentence_weighted(x) for x in tokens_list])
-    
-    w2v_feature_names = [f"w2v_{i}" for i in range(10)]
-    num_feature_names = numerical_cols
-    X_combined_df = pd.DataFrame(np.hstack([X_w2v[:, :10], X_scaled]), columns=w2v_feature_names + num_feature_names)
-    X_combined_df = X_combined_df[final_feature_names]  # 根據訓練時的順序重新排列
-    X_combined = X_combined_df.values
+    tokens_list = df_ready['備註文字_處理'].dropna().apply(lambda x: x.split()).tolist()
+    X_w2v_all = np.array([vectorize_sentence_weighted(x) for x in tokens_list])
+    X_w2v_top = X_w2v_all[:, w2v_indices]
+    X_final = np.hstack([X_w2v_top, X_scaled])
 
-
-    # 合併
-    # X_combined = np.hstack([X_scaled, X_w2v[:, :10]])
-    y_pred_proba = model.predict_proba(X_combined)[:, 1]
+    y_pred_proba = model.predict_proba(X_final)[:, 1]
+    y_pred = (y_pred_proba >= 0.6).astype(int)
     df_ready['預測成交機率'] = y_pred_proba
+    df_ready['預測成交與否'] = y_pred
+
+    # # 自動補上 label（與訓練時一致：拜訪與投保日天數差 <= 30 為成交）
+    # if "label" not in df_ready.columns and "拜訪與投保日天數差" in df_ready.columns:
+    #     df_ready["label"] = df_ready["拜訪與投保日天數差"].apply(lambda x: 1 if pd.notna(x) and x <= 30 else 0)
+
+    # # 移除備註空值或斷詞為空的筆數
+    # df_ready = df_ready[
+    #     df_ready['備註文字_處理'].notna() & 
+    #     (df_ready['備註文字_處理'].str.strip() != '')
+    # ]
+    
+    # # 數值特徵
+    # numerical_cols = [
+    #     '業務客戶性別組合', '最新職級', '拜訪目的', 
+    #     '平均拜訪間隔天數', '每週平均拜訪客戶數', '業務客戶年齡差距', # '拜訪紀錄密度', 
+    #     '備註字數', '有意義詞數', 
+    #     '目前年資', '營業單位_編碼', # '當年度賽季增員數', '加前一賽季增員數', '最新職級', 
+    #     '上半年準客戶數', '今年度活動參與率', '上年度FYC', '距離晉升天數', 
+    #     '件數', '總保費' # '業務客戶性別組合', 
+    # ]
+    # X_num = df_ready[numerical_cols].fillna(0)
+    # X_scaled = scaler.transform(X_num)
+
+    # # TF-IDF + Word2Vec 向量
+    # def vectorize_sentence_weighted(sentence):
+    #     tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
+    #     vecs, weights = [], []
+    #     for word in sentence:
+    #         if word in w2v_model.wv and word in tfidf_dict:
+    #             vecs.append(w2v_model.wv[word] * tfidf_dict[word])
+    #             weights.append(tfidf_dict[word])
+    #     return np.sum(vecs, axis=0) / np.sum(weights) if vecs else np.zeros(w2v_model.vector_size)
+
+    # tokens_list = df_ready['拜訪備註_詞語']
+    # X_w2v = np.array([vectorize_sentence_weighted(x) for x in tokens_list])
+    
+    # w2v_feature_names = [f"w2v_{i}" for i in range(10)]
+    # num_feature_names = numerical_cols
+    # X_combined_df = pd.DataFrame(np.hstack([X_w2v[:, :10], X_scaled]), columns=w2v_feature_names + num_feature_names)
+    # X_combined_df = X_combined_df[final_feature_names]  # 根據訓練時的順序重新排列
+    # X_combined = X_combined_df.values
+
+
+    # # 合併
+    # # X_combined = np.hstack([X_scaled, X_w2v[:, :10]])
+    # y_pred_proba = model.predict_proba(X_combined)[:, 1]
+    # df_ready['預測成交機率'] = y_pred_proba
     df_ready['潛力分類'] = df_ready['預測成交機率'].apply(classify_probability)
-    df_ready['預測成交與否'] = (df_ready['預測成交機率'] >= 0.6).astype(int)
+    # df_ready['預測成交與否'] = (df_ready['預測成交機率'] >= 0.6).astype(int)
 
     # 評估報告產生
     def generate_model_report(y_true, y_pred, y_prob):

@@ -6,7 +6,7 @@ Created on Fri Jul 18 15:41:32 2025
 """
 def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探勘/models"):
     import os
-    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import StratifiedKFold, train_test_split
     from sklearn.preprocessing import StandardScaler
     from sklearn.metrics import classification_report, roc_auc_score, average_precision_score
     from gensim.models import Word2Vec
@@ -76,39 +76,89 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
     final_feature_names = w2v_top_feature_names + numerical_cols
 
     # Step 6: 交叉驗證評估模型
+    # === Hold-out 分割 ===
+    X_trainval, X_test, y_trainval, y_test = train_test_split(
+        X_combined, y, test_size=0.2, stratify=y, random_state=42
+    )
+    
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     roc_scores, pr_scores = [], []
     all_y_true, all_y_pred, all_y_proba = [], [], []
-
-    for train_idx, val_idx in skf.split(X_combined, y):
-        X_train, X_val = X_combined[train_idx], X_combined[val_idx]
-        y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
-
+    
+    for train_idx, val_idx in skf.split(X_trainval, y_trainval):
+        X_train, X_val = X_trainval[train_idx], X_trainval[val_idx]
+        y_train, y_val = y_trainval.iloc[train_idx], y_trainval.iloc[val_idx]
         model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
         model.fit(X_train, y_train)
-
         y_proba = model.predict_proba(X_val)[:, 1]
         y_pred = (y_proba >= 0.6).astype(int)
-
         roc_scores.append(roc_auc_score(y_val, y_proba))
         pr_scores.append(average_precision_score(y_val, y_proba))
         all_y_true.extend(y_val)
         all_y_pred.extend(y_pred)
         all_y_proba.extend(y_proba)
-
+    
     print("\n📊 Cross-Validation Results:")
     print(classification_report(all_y_true, all_y_pred))
     print(f"Average ROC AUC: {np.mean(roc_scores):.4f}")
     print(f"Average PR AUC : {np.mean(pr_scores):.4f}")
-
-    # Step 7: 儲存模型與相關物件
+    
+    # Hold-out 評估
+    final_model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+    final_model.fit(X_trainval, y_trainval)
+    y_test_proba = final_model.predict_proba(X_test)[:, 1]
+    y_test_pred = (y_test_proba >= 0.6).astype(int)
+    print("\n🧪 Final Evaluation on Hold-out Test Set")
+    print(classification_report(y_test, y_test_pred))
+    print(f"ROC AUC: {roc_auc_score(y_test, y_test_proba):.4f}")
+    print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    joblib.dump(model, os.path.join(save_dir, f"model_final_{timestamp}.pkl"))
+    joblib.dump(final_model, os.path.join(save_dir, f"model_final_{timestamp}.pkl"))
     joblib.dump(w2v_model, os.path.join(save_dir, f"word2vec_model_{timestamp}.pkl"))
     joblib.dump(tfidf_vectorizer, os.path.join(save_dir, f"tfidf_vectorizer_{timestamp}.pkl"))
     joblib.dump(scaler, os.path.join(save_dir, f"scaler_{timestamp}.pkl"))
-    with open(os.path.join(save_dir, "final_feature_names.json"), "w", encoding="utf-8") as f: 
-        json.dump(final_feature_names, f, ensure_ascii=False, indent=2)
+    joblib.dump(final_feature_names, os.path.join(save_dir, f"feature_names_{timestamp}.pkl"))
+    
+    # with open(os.path.join(save_dir, "latest.json"), "w", encoding="utf-8") as f:
+    #     json.dump({
+    #         "model": f"model_final_{timestamp}.pkl",
+    #         "word2vec": f"word2vec_model_{timestamp}.pkl",
+    #         "tfidf": f"tfidf_vectorizer_{timestamp}.pkl",
+    #         "scaler": f"scaler_{timestamp}.pkl",
+    #         "features": f"feature_names_{timestamp}.pkl",
+    #         "timestamp": timestamp
+    #     }, f, ensure_ascii=False, indent=2)
+    
+    # for train_idx, val_idx in skf.split(X_combined, y):
+    #     X_train, X_val = X_combined[train_idx], X_combined[val_idx]
+    #     y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
+
+    #     model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+    #     model.fit(X_train, y_train)
+
+    #     y_proba = model.predict_proba(X_val)[:, 1]
+    #     y_pred = (y_proba >= 0.6).astype(int)
+
+    #     roc_scores.append(roc_auc_score(y_val, y_proba))
+    #     pr_scores.append(average_precision_score(y_val, y_proba))
+    #     all_y_true.extend(y_val)
+    #     all_y_pred.extend(y_pred)
+    #     all_y_proba.extend(y_proba)
+
+    # print("\n📊 Cross-Validation Results:")
+    # print(classification_report(all_y_true, all_y_pred))
+    # print(f"Average ROC AUC: {np.mean(roc_scores):.4f}")
+    # print(f"Average PR AUC : {np.mean(pr_scores):.4f}")
+
+    # # Step 7: 儲存模型與相關物件
+    # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    # joblib.dump(model, os.path.join(save_dir, f"model_final_{timestamp}.pkl"))
+    # joblib.dump(w2v_model, os.path.join(save_dir, f"word2vec_model_{timestamp}.pkl"))
+    # joblib.dump(tfidf_vectorizer, os.path.join(save_dir, f"tfidf_vectorizer_{timestamp}.pkl"))
+    # joblib.dump(scaler, os.path.join(save_dir, f"scaler_{timestamp}.pkl"))
+    # with open(os.path.join(save_dir, "final_feature_names.json"), "w", encoding="utf-8") as f: 
+    #     json.dump(final_feature_names, f, ensure_ascii=False, indent=2)
 
     print(f"✅ 模型與向量器已儲存（時間戳記：{timestamp}）")
 
@@ -189,6 +239,7 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
         "tfidf": f"tfidf_vectorizer_{timestamp}.pkl",
         "scaler": f"scaler_{timestamp}.pkl",
         "reference": f"train_reference_{timestamp}.csv",  # optional
+        "features": f"feature_names_{timestamp}.pkl", 
         "timestamp": timestamp
     }
     

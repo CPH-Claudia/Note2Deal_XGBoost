@@ -1051,7 +1051,7 @@ X_trainval, X_test, y_trainval, y_test = train_test_split(
 
 # 轉為 DataFrame
 X_trainval_df = pd.DataFrame(X_trainval, columns=final_feature_names)
-# X_trainval_df.to_csv("D:/備註文字探勘/models/train_reference.csv", index=False)
+X_trainval_df.to_csv("D:/備註文字探勘/models/train_reference.csv", index=False)
 
 model_init = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
 model_init.fit(X_trainval, y_trainval)

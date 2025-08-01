@@ -14,40 +14,21 @@ import pickle
 from sklearn.preprocessing import LabelEncoder
 
 # === 1. VISIT（拜訪資料）===
-# def clean_visit(file_path):
-#     visit = pd.read_excel(file_path, sheet_name="VISIT")
-#     visit['拜訪時間 年/月/日'] = pd.to_datetime(visit['拜訪時間 年/月/日'], errors='coerce')
-
-#     def extract_non_sharp_text(note):
-#         if pd.isna(note): return ''
-#         lines = str(note).replace('_x000D_', '\n').replace('\r', '').splitlines()
-#         return '\n'.join([
-#             line.strip() for line in lines
-#             if line.strip() and not (line.startswith('#') or line.startswith('＃'))
-#         ])
-
-#     visit['拜訪備註_文字'] = visit['拜訪備註'].apply(extract_non_sharp_text)
-#     visit['備註字數'] = visit['拜訪備註_文字'].apply(lambda x: len(str(x).replace(" ", "").replace("\n", "")))
-    
-#     # 計算每位業代對每個客戶的拜訪次數
-#     visit['拜訪次數'] = (
-#         visit.groupby(['業代', '客戶UUID'])['拜訪紀錄UUID']
-#         .transform('count')
-#     )
-
-#     # 計算每位業代對所有客戶的平均拜訪次數
-#     visit['平均每客戶拜訪次數'] = (
-#         visit.groupby('業代')['拜訪次數']
-#         .transform('mean')
-#     )
-
-#     return visit
-
-
-
 def clean_visit(file_path):
     visit = pd.read_excel(file_path, sheet_name="VISIT")
     visit['拜訪時間 年/月/日'] = pd.to_datetime(visit['拜訪時間 年/月/日'], errors='coerce')
+    
+    # 斷詞（跨環境支援）
+    # 匯入預先斷好的 filtered_words，並依照 index 指派回 visit_df
+    try:
+        pkl_path = file_path.replace(".xlsx", "").replace(".xls", "") + ".pkl"
+        with open(pkl_path, "rb") as f:
+            filtered_words = pickle.load(f)
+        visit = visit.reset_index(drop=True)
+        visit['拜訪備註_詞語'] = filtered_words[:len(visit)]
+        visit['備註文字_處理'] = visit['拜訪備註_詞語'].apply(lambda x: ' '.join(x) if isinstance(x, list) else '')
+    except Exception as e:
+        print("❌ 無法載入斷詞結果 filtered_words_test.pkl：", e)
 
     def clean_hashtag(raw_tag):
         """清理標籤內容：去除頭尾雜訊、轉小寫，不保留#"""
@@ -86,6 +67,24 @@ def clean_visit(file_path):
     # 拜訪次數與平均
     visit['拜訪次數'] = visit.groupby(['業代', '客戶UUID'])['拜訪紀錄UUID'].transform('count')
     visit['平均每客戶拜訪次數'] = visit.groupby('業代')['拜訪次數'].transform('mean')
+    
+    # 先按照拜訪時間排序，再依照業代+客戶分組加上序號
+    visit = visit.sort_values(by='拜訪時間 年/月/日')
+    visit['拜訪序號'] = visit.groupby(['業代', '客戶UUID']).cumcount() + 1
+    
+    # 增加賽季欄位
+    def classify_season(date):
+        if 2 <= date.month <= 6:
+            return '夏賽'
+        elif 8 <= date.month <= 12:
+            return '冬賽'
+        else:
+            return '非賽季'
+    
+    visit['賽季'] = visit['拜訪時間 年/月/日'].apply(classify_season)
+    season_map = {'無賽季': 0, '夏賽': 1, '冬賽': 2}
+    visit['賽季'] = visit['賽季'].map(season_map)
+
 
     return visit
 
@@ -128,32 +127,63 @@ def clean_agent(file_path):
     })[['業代', '計績年月', '最新職級', '業務目前年齡', '業務性別', '目前年資']]
     
     # Step 1：動態抓計績年月區間（來自保單/拜訪/agent 任一表都可）
-    max_month = agent['計績年月'].max()
-    max_year = max_month // 100
-    max_m = max_month % 100
-    current_half = 1 if 3 <= max_m <= 6 else 2
+    from pandas.tseries.offsets import DateOffset
     
-    this_start = max_year * 100 + (3 if current_half == 1 else 9)
-    this_end = max_year * 100 + (6 if current_half == 1 else 12)
-    last_start = (max_year - 1 if current_half == 1 else max_year) * 100 + (9 if current_half == 1 else 3)
-    last_end = (max_year - 1 if current_half == 1 else max_year) * 100 + (12 if current_half == 1 else 6)
+    # 將計績年月轉換為 datetime 格式（每月設為當月 1 號）
+    agent['計績年月_dt'] = pd.to_datetime(agent['計績年月'].astype(str) + '01', format='%Y%m%d', errors='coerce')
     
-    # Step 2：今年度/上年度 活動參與率與 FYC 計算
-    this_year_df = agent[(agent['計績年月'] >= this_start) & (agent['計績年月'] <= this_end)]
-    last_year_df = agent[(agent['計績年月'] >= last_start) & (agent['計績年月'] <= last_end)]
+    # === Step 1: 抓每位業代的最後一筆計績年月，回推半年計算 活動參與率 ===
+    last_month = agent.groupby('業代')['計績年月_dt'].max().reset_index()
+    last_month['起'] = last_month['計績年月_dt'] - DateOffset(months=6)
+    last_month['迄'] = last_month['計績年月_dt']
     
-    this_summary = this_year_df.groupby('業代')[['活動參與率', '新繳款FYC']].mean().reset_index().rename(columns={
-        '活動參與率': '今年度活動參與率', '新繳款FYC': '今年度FYC'
-    })
-    last_summary = last_year_df.groupby('業代')[['活動參與率', '新繳款FYC']].mean().reset_index().rename(columns={
-        '活動參與率': '上年度活動參與率', '新繳款FYC': '上年度FYC'
-    })
+    # 合併回原資料，篩出半年內的活動參與率
+    agent_rate = agent.merge(last_month[['業代', '起', '迄']], on='業代')
+    rate_df = agent_rate[(agent_rate['計績年月_dt'] >= agent_rate['起']) & (agent_rate['計績年月_dt'] <= agent_rate['迄'])]
+    rate_summary = rate_df.groupby('業代')['活動參與率'].mean().reset_index().rename(columns={'活動參與率': '最近半年活動參與率'})
+    
+    # === Step 2: 抓每位業代的第一筆計績年月，回推半年計算 新繳款FYC ===
+    first_month = agent.groupby('業代')['計績年月_dt'].min().reset_index()
+    first_month['起'] = first_month['計績年月_dt'] - DateOffset(months=6)
+    first_month['迄'] = first_month['計績年月_dt']
+    
+    # 合併回原資料，篩出半年內的 FYC
+    agent_fyc = agent.merge(first_month[['業代', '起', '迄']], on='業代')
+    fyc_df = agent_fyc[(agent_fyc['計績年月_dt'] >= agent_fyc['起']) & (agent_fyc['計績年月_dt'] <= agent_fyc['迄'])]
+    fyc_summary = fyc_df.groupby('業代')['新繳款FYC'].mean().reset_index().rename(columns={'新繳款FYC': '上一個半年度FYC'})
+    
+    # === Step 3: 合併兩者 ===
+    activity_summary = rate_summary.merge(fyc_summary, on='業代', how='outer')
+    
+    
+    # max_month = agent['計績年月'].max()
+    # max_year = max_month // 100
+    # max_m = max_month % 100
+    # current_half = 1 if 3 <= max_m <= 6 else 2
+    
+    # this_start = max_year * 100 + (3 if current_half == 1 else 9)
+    # this_end = max_year * 100 + (6 if current_half == 1 else 12)
+    # last_start = (max_year - 1 if current_half == 1 else max_year) * 100 + (9 if current_half == 1 else 3)
+    # last_end = (max_year - 1 if current_half == 1 else max_year) * 100 + (12 if current_half == 1 else 6)
+    
+    # # Step 2：今年度/上年度 活動參與率與 FYC 計算
+    # this_year_df = agent[(agent['計績年月'] >= this_start) & (agent['計績年月'] <= this_end)]
+    # last_year_df = agent[(agent['計績年月'] >= last_start) & (agent['計績年月'] <= last_end)]
+    
+    # this_summary = this_year_df.groupby('業代')[['活動參與率', '新繳款FYC']].mean().reset_index().rename(columns={
+    #     '活動參與率': '今年度活動參與率', '新繳款FYC': '今年度FYC'
+    # })
+    # last_summary = last_year_df.groupby('業代')[['活動參與率', '新繳款FYC']].mean().reset_index().rename(columns={
+    #     '活動參與率': '上年度活動參與率', '新繳款FYC': '上年度FYC'
+    # })
     
     
     # 合併
     result = latest_info \
-        .merge(this_summary, on='業代', how='left') \
-        .merge(last_summary, on='業代', how='left')
+        .merge(activity_summary, on='業代', how='left')
+        # .merge(this_summary, on='業代', how='left') \
+        # .merge(last_summary, on='業代', how='left') \
+        
         
     # 9. 加入晉升日（只保留有晉升者）
     has_promotion = agent_sorted[agent_sorted['晉升日'].notna()][['業代', '晉升日']].drop_duplicates('業代')
@@ -169,8 +199,8 @@ def clean_agent(file_path):
     agent_summary['晉升日_dt'] = agent_summary['晉升日'].apply(convert_yyyymm_to_datetime)
 
     # 10. 補值處理
-    agent_summary[['上年度活動參與率', '上年度FYC', '今年度活動參與率', '今年度FYC']] = agent_summary[
-        ['上年度活動參與率', '上年度FYC', '今年度活動參與率', '今年度FYC']
+    agent_summary[['最近半年活動參與率', '上一個半年度FYC']] = agent_summary[
+        ['最近半年活動參與率', '上一個半年度FYC']
     ].fillna(0)
 
     return agent_summary
@@ -343,17 +373,17 @@ def prepare_model_dataset(file_path):
     # 合併後處理
     visit_df['備註字數'] = visit_df['拜訪備註_文字'].apply(lambda x: len(str(x).replace(" ", "").replace("\n", "")))
     
-    # 斷詞（跨環境支援）
-    # 匯入預先斷好的 filtered_words，並依照 index 指派回 visit_df
-    try:
-        pkl_path = file_path.replace(".xlsx", "").replace(".xls", "") + ".pkl"
-        with open(pkl_path, "rb") as f:
-            filtered_words = pickle.load(f)
-        visit_df = visit_df.reset_index(drop=True)
-        visit_df['拜訪備註_詞語'] = filtered_words[:len(visit_df)]
-        visit_df['備註文字_處理'] = visit_df['拜訪備註_詞語'].apply(lambda x: ' '.join(x) if isinstance(x, list) else '')
-    except Exception as e:
-        print("❌ 無法載入斷詞結果 filtered_words_test.pkl：", e)
+    # # 斷詞（跨環境支援）
+    # # 匯入預先斷好的 filtered_words，並依照 index 指派回 visit_df
+    # try:
+    #     pkl_path = file_path.replace(".xlsx", "").replace(".xls", "") + ".pkl"
+    #     with open(pkl_path, "rb") as f:
+    #         filtered_words = pickle.load(f)
+    #     visit_df = visit_df.reset_index(drop=True)
+    #     visit_df['拜訪備註_詞語'] = filtered_words[:len(visit_df)]
+    #     visit_df['備註文字_處理'] = visit_df['拜訪備註_詞語'].apply(lambda x: ' '.join(x) if isinstance(x, list) else '')
+    # except Exception as e:
+    #     print("❌ 無法載入斷詞結果 filtered_words_test.pkl：", e)
     
     # 衍生欄位計算
     def compute_gender_diff_v2(row):
@@ -470,7 +500,7 @@ def prepare_model_dataset(file_path):
         else:
             return pd.Series([np.nan, pd.NaT, np.nan])
     
-        return pd.Series([(visit_time - r['投保日']).days, r['投保日'], r['是否為網路投保']])
+        return pd.Series([(r['投保日'] - visit_time).days, r['投保日'], r['是否為網路投保']])
     
     # 套用到每一列
     df_valid[['拜訪與投保日天數差', '最近投保日', '最近是否為網路投保']] = df_valid.apply(
@@ -483,7 +513,7 @@ def prepare_model_dataset(file_path):
 
 # ✅ 執行
 if __name__ == '__main__':
-    file = "D:/備註文字探勘/repeater/新資料_0704.xlsx"
+    file = "D:/備註文字探勘/repeater/新資料_0731.xlsx"
     df_ready, policy_df = prepare_model_dataset(file)
     print("✅ 資料整合與欄位齊備，筆數：", len(df_ready))
     

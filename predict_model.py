@@ -27,26 +27,6 @@ def load_models(model_dir="D:/備註文字探勘/models"):
     return model, w2v_model, tfidf, scaler, features
 
 
-# def load_models(model_dir="D:/備註文字探勘/models"):
-#     latest_path = os.path.join(model_dir, "latest.json")
-#     if not os.path.exists(latest_path):
-#         raise FileNotFoundError("❌ 找不到 latest.json，請先執行模型訓練。")
-
-#     with open(latest_path, "r", encoding="utf-8") as f:
-#         latest = json.load(f)
-
-#     model = joblib.load(os.path.join(model_dir, latest["model"]))
-#     w2v_model = joblib.load(os.path.join(model_dir, latest["word2vec"]))
-#     tfidf = joblib.load(os.path.join(model_dir, latest["tfidf"]))
-#     scaler = joblib.load(os.path.join(model_dir, latest["scaler"]))
-#     with open(os.path.join(model_dir, "final_feature_names.json"), "r", encoding="utf-8") as f: 
-#         final_feature_names = json.load(f)
-    
-    
-#     print(f"✅ 已載入模型版本：{latest['timestamp']}")
-#     return model, w2v_model, tfidf, scaler, final_feature_names
-
-
 def classify_probability(p):
     if p >= 0.9: return "極高潛力"
     elif p >= 0.75: return "高潛力"
@@ -135,12 +115,6 @@ def predict_with_model(df_ready, output_path, source_file=None):
     # # 自動補上 label（與訓練時一致：拜訪與投保日天數差 <= 30 為成交）
     # if "label" not in df_ready.columns and "拜訪與投保日天數差" in df_ready.columns:
     #     df_ready["label"] = df_ready["拜訪與投保日天數差"].apply(lambda x: 1 if pd.notna(x) and x <= 30 else 0)
-
-    # # 移除備註空值或斷詞為空的筆數
-    # df_ready = df_ready[
-    #     df_ready['備註文字_處理'].notna() & 
-    #     (df_ready['備註文字_處理'].str.strip() != '')
-    # ]
     
     # # 數值特徵
     # numerical_cols = [

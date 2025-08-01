@@ -22,10 +22,12 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
     # # Step 0: 篩選有效樣本
     # df_ready = df_ready[df_ready['拜訪目的'].notna()]
     # df_ready = df_ready[df_ready['備註文字_處理'].str.strip() != '']
-
+    
     # Step 1: 建立成交標籤
     df_model = df_ready[df_ready['平均每客戶拜訪次數'] > 4].copy()
-    df_model["label"] = df_model["拜訪與投保日天數差"].apply(lambda x: 1 if pd.notna(x) and x <= 30 else 0)
+    df_model["label"] = df_model["拜訪與投保日天數差"].apply(
+        lambda x: 1 if pd.notna(x) and x >= -7 and x <= 180 else 0
+    )
     y = df_model["label"]
 
     # Step 2: 數值特徵
@@ -34,10 +36,10 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
         '平均拜訪間隔天數', '每週平均拜訪客戶數', '業務客戶年齡差距', 
         '備註字數', '有意義詞數', 
         '目前年資', '營業單位_編碼', 
-        '上半年準客戶數', '今年度活動參與率', '上年度FYC', '距離晉升天數', 
-        '件數', '總保費'
+        '上半年準客戶數', '最近半年活動參與率', '上一個半年度FYC', '距離晉升天數', 
+        '件數', '總保費', '拜訪序號', '賽季'
     ]
-    X_num = df_model[numerical_cols].fillna(0)
+    X_num = df_model[numerical_cols].astype(float).fillna(0)
     scaler = StandardScaler()
     X_num_scaled = scaler.fit_transform(X_num)
 
@@ -63,7 +65,7 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
 
     # Step 4: 選擇 Word2Vec Top 10 特徵
     X_all = np.hstack([X_w2v_weighted, X_num_scaled])
-    model_init = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+    model_init = XGBClassifier(eval_metric='logloss', random_state=42)
     model_init.fit(X_all, y)
     w2v_importances = model_init.feature_importances_[:X_w2v_weighted.shape[1]]
     top_k = 10
@@ -81,6 +83,9 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
         X_combined, y, test_size=0.2, stratify=y, random_state=42
     )
     
+    df_model["資料集"] = "Train+CV"
+    df_model.loc[df_model.tail(X_test.shape[0]).index, "資料集"] = "Holdout"
+    
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
     roc_scores, pr_scores = [], []
     all_y_true, all_y_pred, all_y_proba = [], [], []
@@ -88,7 +93,8 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
     for train_idx, val_idx in skf.split(X_trainval, y_trainval):
         X_train, X_val = X_trainval[train_idx], X_trainval[val_idx]
         y_train, y_val = y_trainval.iloc[train_idx], y_trainval.iloc[val_idx]
-        model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+        model = XGBClassifier(eval_metric='logloss', random_state=42, 
+                                   scale_pos_weight=(y_train.value_counts()[0]/y_train.value_counts()[1]))
         model.fit(X_train, y_train)
         y_proba = model.predict_proba(X_val)[:, 1]
         y_pred = (y_proba >= 0.6).astype(int)
@@ -104,7 +110,8 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
     print(f"Average PR AUC : {np.mean(pr_scores):.4f}")
     
     # Hold-out 評估
-    final_model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
+    final_model = XGBClassifier(eval_metric='logloss', random_state=42, 
+                               scale_pos_weight=(y_trainval.value_counts()[0]/y_trainval.value_counts()[1]))
     final_model.fit(X_trainval, y_trainval)
     y_test_proba = final_model.predict_proba(X_test)[:, 1]
     y_test_pred = (y_test_proba >= 0.6).astype(int)
@@ -113,12 +120,44 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
     print(f"ROC AUC: {roc_auc_score(y_test, y_test_proba):.4f}")
     print(f"PR AUC : {average_precision_score(y_test, y_test_proba):.4f}")
     
+    # Step 7: 儲存模型與相關物件
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     joblib.dump(final_model, os.path.join(save_dir, f"model_final_{timestamp}.pkl"))
     joblib.dump(w2v_model, os.path.join(save_dir, f"word2vec_model_{timestamp}.pkl"))
     joblib.dump(tfidf_vectorizer, os.path.join(save_dir, f"tfidf_vectorizer_{timestamp}.pkl"))
     joblib.dump(scaler, os.path.join(save_dir, f"scaler_{timestamp}.pkl"))
     joblib.dump(final_feature_names, os.path.join(save_dir, f"feature_names_{timestamp}.pkl"))
+    
+    # Step 8.5: 儲存模型紀錄結果到 CSV
+    
+    # # df_model_cv = df_model.reset_index(drop=True).iloc[y_trainval.index].copy()
+    # df_model_cv = df_model.loc[y_trainval.index].copy()
+    # df_model_cv["CV_預測機率"] = all_y_proba
+    # df_model_cv["CV_預測值"] = all_y_pred
+    # df_model_cv["CV_實際值"] = all_y_true
+    
+    # # df_model_test = df_model.reset_index(drop=True).iloc[y_test.index].copy()
+    # # df_model_test = df_model.iloc[y.index].reset_index(drop=True)
+    # # test_indices = y_test.index
+    # # df_model_test = df_model_test.iloc[test_indices].copy()
+    # df_model_test = df_model.loc[y_test.index].copy()
+    # df_model_test["Test_預測機率"] = y_test_proba
+    # df_model_test["Test_預測值"] = y_test_pred
+    # df_model_test["Test_實際值"] = y_test.reset_index(drop=True)
+    
+    # monitoring_path = os.path.join("D:/備註文字探勘/results", "model_monitoring.csv")
+    # monitoring_df = pd.DataFrame([monitoring_row])
+    
+    # # 若檔案存在就 append，否則建立新檔
+    # if os.path.exists(monitoring_path):
+    #     monitoring_df.to_csv(monitoring_path, mode='a', header=False, index=False, encoding='utf-8-sig')
+    # else:
+    #     monitoring_df.to_csv(monitoring_path, index=False, encoding='utf-8-sig')
+    
+    # print(f"📈 模型監測資料已更新：{monitoring_path}")
+    
+    
+
     
     # with open(os.path.join(save_dir, "latest.json"), "w", encoding="utf-8") as f:
     #     json.dump({
@@ -160,7 +199,7 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
     # with open(os.path.join(save_dir, "final_feature_names.json"), "w", encoding="utf-8") as f: 
     #     json.dump(final_feature_names, f, ensure_ascii=False, indent=2)
 
-    print(f"✅ 模型與向量器已儲存（時間戳記：{timestamp}）")
+    # print(f"✅ 模型與向量器已儲存（時間戳記：{timestamp}）")
 
     # Step 8: 匯出預測機率與斷詞的長格式
     df_model = df_model.reset_index(drop=True)
@@ -226,11 +265,61 @@ def train_model_pipeline(df_ready, policy_df=None, save_dir="D:/備註文字探�
     from pandas import ExcelWriter
     output_path = os.path.join("D:/備註文字探勘/results", f"retrain_output_{timestamp}.xlsx")
     with ExcelWriter(output_path, engine='xlsxwriter') as writer:
+        # 全部樣本的預測
         df_model.assign(預測機率=y_proba_final).to_excel(writer, index=False, sheet_name="ModelResults")
+        # # Cross-Validation 預測結果
+        # df_model_cv.to_excel(writer, index=False, sheet_name="CV_Evaluation")
+        # # Hold-out 測試集結果
+        # df_model_test.to_excel(writer, index=False, sheet_name="Holdout_Evaluation")
+        # WordCloud 長格式
         wordcloud_df.to_excel(writer, index=False, sheet_name="WordCloud")
+        # SHAP 貢獻區間
         pd.DataFrame(summary_list).to_excel(writer, sheet_name="SHAP貢獻區間", index=False)
 
     print(f"✅ 資料已儲出至：{output_path}")
+    
+    # Step 10: 儲存模型紀錄結果到 CSV
+    # 統計交叉驗證訓練集樣本
+    monitoring_row = {
+        "timestamp": timestamp,
+        "model_file": f"model_final_{timestamp}.pkl",
+    
+        # Hold-out 測試集
+        "test_sample_size": len(y_test),
+        "test_positive_ratio": round(np.mean(y_test), 4),
+        "test_roc_auc": roc_auc_score(y_test, y_test_proba),
+        "test_pr_auc": average_precision_score(y_test, y_test_proba),
+    
+        # Cross-validation 訓練集
+        "cv_sample_size": len(y_trainval),
+        "cv_positive_ratio": round(np.mean(y_trainval), 4),
+        "train_cv_roc_auc": np.mean(roc_scores),
+        "train_cv_pr_auc": np.mean(pr_scores)
+    }
+    monitoring_df = pd.DataFrame([monitoring_row])
+            
+    # === SHAP 正向區間 log ===
+    shap_range_log = pd.DataFrame(summary_list)
+    shap_range_log.insert(0, "timestamp", timestamp)
+    
+    # === 儲存至 Excel（多 Sheet）===
+    monitoring_xlsx_path = os.path.join("D:/備註文字探勘/results", "model_monitoring.xlsx")
+    
+    if os.path.exists(monitoring_xlsx_path):
+        with ExcelWriter(monitoring_xlsx_path, engine="openpyxl", mode='a', if_sheet_exists='overlay') as writer:
+            # Append summary_log
+            existing_summary = pd.read_excel(monitoring_xlsx_path, sheet_name="summary_log")
+            pd.concat([existing_summary, monitoring_df], ignore_index=True).to_excel(writer, sheet_name="summary_log", index=False)
+            
+            # Append shap_range_log
+            existing_shap = pd.read_excel(monitoring_xlsx_path, sheet_name="shap_ranges_log")
+            pd.concat([existing_shap, shap_range_log], ignore_index=True).to_excel(writer, sheet_name="shap_ranges_log", index=False)
+    else:
+        with ExcelWriter(monitoring_xlsx_path, engine="openpyxl") as writer:
+            monitoring_df.to_excel(writer, sheet_name="summary_log", index=False)
+            shap_range_log.to_excel(writer, sheet_name="shap_ranges_log", index=False)
+    
+    print(f"📈 模型監控與 SHAP 區間已寫入：{monitoring_xlsx_path}")
     
     # Step 10: 更新 latest.json
     latest_info = {

@@ -218,6 +218,6 @@ def full_pipeline_with_ckip(file_path):
 
 # ✅ 範例執行
 if __name__ == '__main__':
-    file = "D:/備註文字探勘/repeater/新資料_0704.xlsx"
+    file = "D:/備註文字探勘/repeater/新資料_0731.xlsx"
     df_ready, policy_df = full_pipeline_with_ckip(file)
     print("✅ 全流程完成，可用於預測，樣本數：", len(df_ready))

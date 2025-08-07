@@ -1,4 +1,7 @@
 # 成交預測模型
+---
+
+## 📁 專案架構
 原始程式碼: 成交預測模型_拜訪備註.py
 pipeline:
 斷字+主程式 full_pipeline_with_ckip.py full_pipeline_with_ckip
@@ -6,25 +9,6 @@ pipeline:
 2. 資料偏移檢查 drift_check.py check_drift_and_warn, get_latest_train_reference_path
 3. 資料重建模+預測 retrain_model_label.py train_model_pipeline_with_strategies
 4. 預測 predict_model.py predict_with_model
----
-
-## 📁 專案架構
-repeater/
-├── full_pipeline_with_ckip.py # 主流程：斷詞 + 資料清理 + 模型預測/重訓 + 匯出結果
-├── predict_model.py # 載入模型並執行預測與斷詞長格式輸出
-├── retrain_model_label.py # 含多策略訓練的主模型訓練與 SHAP 分析
-├── retrain_model.py # 基本訓練流程（保留用途）
-├── drift_check.py # 資料漂移檢查模組
-├── insurance_data_clean.py # 特徵清理與欄位轉換
-├── models/
-│ ├── model_final_.pkl # 訓練好的 XGBoost 模型
-│ ├── word2vec_model_.pkl # 詞向量模型
-│ ├── tfidf_vectorizer_.pkl # TF-IDF 權重模型
-│ ├── scaler_.pkl # 數值標準化器
-│ ├── feature_names_*.pkl # 輸入特徵名稱
-│ ├── latest.json # 指向最新模型的索引檔
-│ └── <timestamp>/train_reference.csv # 各次訓練對應的原始參考資料
-└── requirements.txt
 ---
 
 ## ⚙️ 執行流程簡介

@@ -1,13 +1,16 @@
 # 成交預測模型
 
-## 📁 專案架構
-原始程式碼: 成交預測模型_拜訪備註.py
-pipeline:
-斷字+主程式 full_pipeline_with_ckip.py full_pipeline_with_ckip
-1. 資料清理 insurance_data_clean.py prepare_model_dataset
-2. 資料偏移檢查 drift_check.py check_drift_and_warn, get_latest_train_reference_path
-3. 資料重建模+預測 retrain_model_label.py train_model_pipeline_with_strategies
-4. 預測 predict_model.py predict_with_model
+## 🔧 主要模組與函數說明
+
+| 功能分類     | 檔案                             | 主要函數                           | 說明                             |
+|--------------|----------------------------------|------------------------------------|----------------------------------|
+| 資料清理     | `insurance_data_clean.py`        | `prepare_model_dataset`           | 清理拜訪資料與保單欄位，合併成模型訓練格式 |
+| 資料偏移檢查 | `drift_check.py`                 | `check_drift_and_warn`            | 使用 KS 檢定確認新資料是否與訓練資料分布不同 |
+|              |                                  | `get_latest_train_reference_path` | 取得最新訓練資料作為參考比對基準         |
+| 模型訓練與預測 | `retrain_model_label.py`         | `train_model_pipeline_with_strategies` | 執行多策略模型訓練與 SHAP 解釋、模型儲存 |
+| 預測與輸出   | `predict_model.py`               | `predict_with_model`              | 載入最新模型進行預測與長格式詞語輸出     |
+| 主流程入口   | `full_pipeline_with_ckip.py`     | `full_pipeline_with_ckip`         | 整合斷詞、清理、偏移檢查、預測/重訓邏輯   |
+
 ---
 
 ## ⚙️ 執行流程簡介

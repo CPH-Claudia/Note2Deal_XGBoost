@@ -6,6 +6,7 @@ Created on Thu Jun  5 15:31:14 2025
 """
 
 # === 📂 7份 Excel 工作表的資料清理流程 ===
+# file_path = "D:/備註文字探勘/repeater/新資料_0731.xlsx"
 
 import pandas as pd
 import re
@@ -29,7 +30,7 @@ def clean_visit(file_path):
         visit['備註文字_處理'] = visit['拜訪備註_詞語'].apply(lambda x: ' '.join(x) if isinstance(x, list) else '')
     except Exception as e:
         print("❌ 無法載入斷詞結果 filtered_words_test.pkl：", e)
-
+    
     def clean_hashtag(raw_tag):
         """清理標籤內容：去除頭尾雜訊、轉小寫，不保留#"""
         tag = re.sub(r'^[^a-zA-Z0-9\u4e00-\u9fa5]+', '', raw_tag)
@@ -85,9 +86,7 @@ def clean_visit(file_path):
     season_map = {'無賽季': 0, '夏賽': 1, '冬賽': 2}
     visit['賽季'] = visit['賽季'].map(season_map)
 
-
     return visit
-
 
 
 # === 2. TAGS（拜訪標籤）===
@@ -156,33 +155,9 @@ def clean_agent(file_path):
     activity_summary = rate_summary.merge(fyc_summary, on='業代', how='outer')
     
     
-    # max_month = agent['計績年月'].max()
-    # max_year = max_month // 100
-    # max_m = max_month % 100
-    # current_half = 1 if 3 <= max_m <= 6 else 2
-    
-    # this_start = max_year * 100 + (3 if current_half == 1 else 9)
-    # this_end = max_year * 100 + (6 if current_half == 1 else 12)
-    # last_start = (max_year - 1 if current_half == 1 else max_year) * 100 + (9 if current_half == 1 else 3)
-    # last_end = (max_year - 1 if current_half == 1 else max_year) * 100 + (12 if current_half == 1 else 6)
-    
-    # # Step 2：今年度/上年度 活動參與率與 FYC 計算
-    # this_year_df = agent[(agent['計績年月'] >= this_start) & (agent['計績年月'] <= this_end)]
-    # last_year_df = agent[(agent['計績年月'] >= last_start) & (agent['計績年月'] <= last_end)]
-    
-    # this_summary = this_year_df.groupby('業代')[['活動參與率', '新繳款FYC']].mean().reset_index().rename(columns={
-    #     '活動參與率': '今年度活動參與率', '新繳款FYC': '今年度FYC'
-    # })
-    # last_summary = last_year_df.groupby('業代')[['活動參與率', '新繳款FYC']].mean().reset_index().rename(columns={
-    #     '活動參與率': '上年度活動參與率', '新繳款FYC': '上年度FYC'
-    # })
-    
-    
     # 合併
     result = latest_info \
         .merge(activity_summary, on='業代', how='left')
-        # .merge(this_summary, on='業代', how='left') \
-        # .merge(last_summary, on='業代', how='left') \
         
         
     # 9. 加入晉升日（只保留有晉升者）
@@ -202,15 +177,25 @@ def clean_agent(file_path):
     agent_summary[['最近半年活動參與率', '上一個半年度FYC']] = agent_summary[
         ['最近半年活動參與率', '上一個半年度FYC']
     ].fillna(0)
+    
+    # ✅ 新增：回傳完整晉升歷史 promotion_df（後續 merge_asof 用）
+    promotion_df = agent_sorted[agent_sorted['是否晉升']][['業代', '計績年月']].copy()
+    promotion_df = promotion_df.dropna(subset=['計績年月'])  # 去除空值
+    promotion_df['晉升日_dt'] = pd.to_datetime(promotion_df['計績年月'].astype(str) + '01', format='%Y%m%d', errors='coerce')
+    promotion_df = promotion_df.dropna(subset=['晉升日_dt'])  # 避免 merge_asof 錯誤
+    promotion_df = promotion_df[['業代', '晉升日_dt']]  # 確保欄位乾淨
+    all_agents = agent['業代'].drop_duplicates()
+    promotion_df = all_agents.to_frame().merge(promotion_df, on='業代', how='left')
 
-    return agent_summary
+    return agent_summary, promotion_df
 
-# === 4. MEMBER（增員資料）===
-def clean_member(file_path):
-    member = pd.read_excel(file_path, sheet_name="MEMBER", dtype={'業代': str})
-    count_summary = member.groupby('引薦主管業代')['業代'].nunique().reset_index()
-    count_summary.columns = ['業代', '當年度增員數']
-    return count_summary
+
+# # === 4. MEMBER（增員資料）===
+# def clean_member(file_path):
+#     member = pd.read_excel(file_path, sheet_name="MEMBER", dtype={'業代': str})
+#     count_summary = member.groupby('引薦主管業代')['業代'].nunique().reset_index()
+#     count_summary.columns = ['業代', '當年度增員數']
+#     return count_summary
 
 # # === 5. CUSTOMER（準客戶與新增保戶）===
 from dateutil.relativedelta import relativedelta
@@ -302,13 +287,14 @@ def clean_personal_tags(file_path):
     return df_tags_merged
 
 
+
 # === ✅ 整合資料打包函式 ===
 def prepare_model_dataset(file_path):
     visit_df = clean_visit(file_path)
     visit_dates = pd.to_datetime(visit_df['拜訪時間 年/月/日'], errors='coerce').dropna().tolist()
     tags_df = clean_tags(file_path)
-    agent_df = clean_agent(file_path)
-    member_df = clean_member(file_path)
+    agent_df, promotion_df = clean_agent(file_path)
+    # member_df = clean_member(file_path)
     customer_df = clean_customer(file_path, reference_dates=visit_dates)
     info_df = clean_info(file_path)
     policy_df = clean_policy(file_path)
@@ -320,11 +306,35 @@ def prepare_model_dataset(file_path):
     # 合併 AGENT
     visit_df = visit_df.merge(agent_df, on='業代', how='left')
     visit_df['拜訪時間 年/月/日'] = pd.to_datetime(visit_df['拜訪時間 年/月/日'], errors='coerce')
-    visit_df['距離晉升天數'] = (visit_df['晉升日_dt'] - visit_df['拜訪時間 年/月/日']).dt.days
-
-    # 合併 MEMBER 增員數
-    visit_df = visit_df.merge(member_df, on='業代', how='left')
-    visit_df['當年度增員數'] = visit_df['當年度增員數'].fillna(0).astype(int)
+    # visit_df['距離晉升天數'] = (visit_df['晉升日_dt'] - visit_df['拜訪時間 年/月/日']).dt.days
+    # === 處理 promotion_df，計算「距離最近晉升天數」 ===
+    # 確保格式正確
+    promotion_df['晉升日_dt'] = pd.to_datetime(promotion_df['晉升日_dt'])
+    
+    # 建立 lookup：每個業代對應的所有晉升日 list
+    promotion_lookup = promotion_df.groupby('業代')['晉升日_dt'].apply(list).to_dict()
+    
+    # 對每筆拜訪，計算距離最近的晉升日（可以為正/負）
+    def find_nearest_promotion(row):
+        agent = row['業代']
+        visit_date = row['拜訪時間 年/月/日']
+        if agent not in promotion_lookup:
+            return pd.Series([pd.NaT, None])
+    
+        dates = promotion_lookup[agent]
+        deltas = [abs((d - visit_date).days) for d in dates]
+        closest_idx = deltas.index(min(deltas))
+        closest_date = dates[closest_idx]
+        distance = (closest_date - visit_date).days  # 可為正負
+        return pd.Series([closest_date, distance])
+    
+    # 套用到 visit_df
+    visit_df[['最近晉升日_dt', '距離最近晉升天數']] = visit_df.apply(find_nearest_promotion, axis=1)
+    visit_df['距離最近晉升天數'] = visit_df['距離最近晉升天數'].fillna(0)
+    
+    # # 合併 MEMBER 增員數
+    # visit_df = visit_df.merge(member_df, on='業代', how='left')
+    # visit_df['當年度增員數'] = visit_df['當年度增員數'].fillna(0).astype(int)
 
     # 合併 CUSTOMER 客戶統計
     visit_df = visit_df.merge(customer_df, on='業代', how='left')
@@ -338,52 +348,11 @@ def prepare_model_dataset(file_path):
     
     # 合併 TAGS_LAB 個人化標籤資料
     visit_df = visit_df.merge(label_df, on='客戶UUID', how='left')
-    
-    # from sklearn.preprocessing import MultiLabelBinarizer
-    # def encode_personal_tags(df):
-    #     # 合併兩欄標籤
-    #     combined_tags = (
-    #         df['個人化標籤_背景'].fillna('') + ',' +
-    #         df['個人化標籤_銷售'].fillna('')
-    #     ).str.strip(',').str.split(',')
-    
-    #     mlb = MultiLabelBinarizer()
-    #     tag_matrix = mlb.fit_transform(combined_tags)
-    
-    #     tag_df = pd.DataFrame(tag_matrix, columns=[f"標籤_{t}" for t in mlb.classes_])
-    #     tag_df.index = df.index
-    
-    #     df = pd.concat([df, tag_df], axis=1)
-    #     return df
-    
-    # def encode_personal_tags(df):
-    #     tag_types = {
-    #         '個人化標籤_背景': '背景',
-    #         '個人化標籤_銷售': '銷售'
-    #     }
-    #     for original_col, tag_type_label in tag_types.items():
-    #         if original_col in df.columns:
-    #             dummies = df[original_col].str.get_dummies(sep=',')
-    #             dummies.columns = [f"標籤({tag_type_label})_{c}" for c in dummies.columns]
-    #             df = pd.concat([df, dummies], axis=1)
-    #     return df
-
-    # visit_df = encode_personal_tags(visit_df)
 
     # 合併後處理
     visit_df['備註字數'] = visit_df['拜訪備註_文字'].apply(lambda x: len(str(x).replace(" ", "").replace("\n", "")))
     
-    # # 斷詞（跨環境支援）
-    # # 匯入預先斷好的 filtered_words，並依照 index 指派回 visit_df
-    # try:
-    #     pkl_path = file_path.replace(".xlsx", "").replace(".xls", "") + ".pkl"
-    #     with open(pkl_path, "rb") as f:
-    #         filtered_words = pickle.load(f)
-    #     visit_df = visit_df.reset_index(drop=True)
-    #     visit_df['拜訪備註_詞語'] = filtered_words[:len(visit_df)]
-    #     visit_df['備註文字_處理'] = visit_df['拜訪備註_詞語'].apply(lambda x: ' '.join(x) if isinstance(x, list) else '')
-    # except Exception as e:
-    #     print("❌ 無法載入斷詞結果 filtered_words_test.pkl：", e)
+    
     
     # 衍生欄位計算
     def compute_gender_diff_v2(row):
@@ -511,9 +480,9 @@ def prepare_model_dataset(file_path):
     return df_valid, policy_df
 
 
-# ✅ 執行
-if __name__ == '__main__':
-    file = "D:/備註文字探勘/repeater/新資料_0731.xlsx"
-    df_ready, policy_df = prepare_model_dataset(file)
-    print("✅ 資料整合與欄位齊備，筆數：", len(df_ready))
+# # ✅ 執行
+# if __name__ == '__main__':
+#     file = "D:/備註文字探勘/repeater/新資料_0731.xlsx"
+#     df_ready, policy_df = prepare_model_dataset(file)
+#     print("✅ 資料整合與欄位齊備，筆數：", len(df_ready))
     

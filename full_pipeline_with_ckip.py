@@ -147,64 +147,36 @@ def full_pipeline_with_ckip(file_path):
         pickle.dump(filtered_words, f)
 
     print(f"✅ 斷詞完成，共 {len(filtered_words)} 筆，接續資料整併...")
-
-    # from sklearn.feature_extraction.text import TfidfVectorizer
-    
-    # def vectorize_hashtag_features(df, text_col='標籤_文字', prefix='hashtag_', max_features=30):
-    #     """
-    #     將 #標籤文字 欄位轉為 TF-IDF 特徵向量並合併回原 df。
-        
-    #     參數:
-    #     - df: 原始 DataFrame
-    #     - text_col: 儲存 hashtag 的欄位名稱
-    #     - prefix: 新欄位前綴字
-    #     - max_features: 限制最多多少個 TF-IDF 字詞
-    
-    #     """
-    #     df = df.copy()
-    #     df[text_col] = df[text_col].fillna('').astype(str).str.replace('_x000D_', ' ').str.replace('\n', ' ')
-    #     corpus = df[text_col].tolist()
-    
-    #     vectorizer = TfidfVectorizer(max_features=max_features, token_pattern=r'(?u)#?\b\w+\b')
-    #     tfidf_matrix = vectorizer.fit_transform(corpus)
-    #     tfidf_df = pd.DataFrame(tfidf_matrix.toarray(), columns=[prefix + w for w in vectorizer.get_feature_names_out()])
-    #     tfidf_df.index = df.index
-    
-    #     df_with_hashtag_vec = pd.concat([df, tfidf_df], axis=1)
-    #     return df_with_hashtag_vec
     
     
-    # === Step 2: 清理與欄位整合 ===
     from insurance_data_clean import prepare_model_dataset
     df_ready, policy_df = prepare_model_dataset(file_path)
     print("📊 資料整併完成，樣本數：", len(df_ready))
-    
-    # === Step 1.5: 清理備註空值資料（與訓練一致）===
+
+    # === 清理備註空值資料（與訓練一致）===
     df_ready = df_ready[
         df_ready['備註文字_處理'].notna() &
         (df_ready['備註文字_處理'].str.strip() != '')
     ]
-    
-    from drift_check import check_drift_and_warn
-    ref_path = "D:/備註文字探勘/models/train_reference.csv"
+
+    from drift_check import check_drift_and_warn, get_latest_train_reference_path
+    ref_path = get_latest_train_reference_path()
     safe_to_predict = check_drift_and_warn(df_ready, ref_path, stop_if_drift=True)
-    # if not safe_to_predict:
-    #     return df_ready, policy_df  # 中止流程
-    
-    from retrain_model import retrain_and_save_model # train_model_pipeline, 
+
     if not safe_to_predict:
         print("⚠️ 偵測到資料偏移，正在重新訓練模型...")
-        # train_model_pipeline(df_ready, policy_df, save_dir="D:/備註文字探勘/models")
-        retrain_and_save_model(df_ready, policy_df, save_dir="D:/備註文字探勘/models")
+        from retrain_model_label import train_model_pipeline_with_strategies
+        train_model_pipeline_with_strategies(df_ready, policy_df)
+        return df_ready, policy_df  # ❗ retrain 中已處理預測與輸出，這裡直接結束流程
 
-    # === Step 3: 模型預測與輸出 ===
+    # === 若無資料偏移，使用既有模型進行預測 ===
     from predict_model import predict_with_model
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     output_path = os.path.join(output_dir, f"results/預測_{timestamp}.xlsx")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    predict_with_model(df_ready, output_path, source_file=file)
-    
-    # === Step 5: 建立斷詞長格式（包含預測機率）===
+    predict_with_model(df_ready, output_path, source_file=file_path)
+
+    # === 建立斷詞長格式（包含預測機率）===
     tokens_exploded = df_ready[[
         '客戶UUID', '拜訪紀錄UUID', '拜訪備註_詞語', '預測成交機率'
     ]].explode('拜訪備註_詞語').rename(columns={'拜訪備註_詞語': '詞語'}).dropna(subset=['詞語'])
@@ -216,8 +188,17 @@ def full_pipeline_with_ckip(file_path):
     return df_ready, policy_df
 
 
-# ✅ 範例執行
+
+# ✅ 範例執行 
 if __name__ == '__main__':
-    file = "D:/備註文字探勘/repeater/新資料_0731.xlsx"
-    df_ready, policy_df = full_pipeline_with_ckip(file)
-    print("✅ 全流程完成，可用於預測，樣本數：", len(df_ready))
+    import os
+
+    # Prompt the user to enter the input Excel file path
+    file = input("Please enter the full path to the new Excel data file:\n")
+
+    # Check if the file exists
+    if not os.path.isfile(file):
+        print(f"❌ File not found: {file}")
+    else:
+        df_ready, policy_df = full_pipeline_with_ckip(file)
+        print("✅ Pipeline completed. Number of records ready for prediction:", len(df_ready))

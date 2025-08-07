@@ -8,6 +8,16 @@ Created on Mon Jun  9 09:42:34 2025
 # -*- coding: utf-8 -*-
 import pandas as pd
 from scipy.stats import ks_2samp
+import os
+
+def get_latest_train_reference_path(base_dir="D:/備註文字探勘/models"):
+    subdirs = [d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))]
+    subdirs = sorted(subdirs, reverse=True)
+    for sub in subdirs:
+        ref_path = os.path.join(base_dir, sub, "train_reference.csv")
+        if os.path.exists(ref_path):
+            return ref_path
+    return None
 
 def detect_feature_drift(new_df, ref_df, columns, p_threshold=0.05):
     drift_flags = {}
@@ -26,6 +36,13 @@ def check_drift_and_warn(new_df, ref_path, selected_cols=None, stop_if_drift=Fal
             '上半年準客戶數', '今年度活動參與率', '上年度FYC'
         ]
     try:
+        # 若 ref_path 為 None，自動找最新 train_reference.csv
+        if ref_path is None:
+            ref_path = get_latest_train_reference_path()
+            if ref_path is None:
+                print("⚠️ 找不到任何 train_reference.csv，將略過資料漂移檢查")
+                return True  # 沒有參考資料就允許繼續執行
+    
         ref_df = pd.read_csv(ref_path)
         drift_results = detect_feature_drift(new_df, ref_df, selected_cols)
         drift_alerts = [col for col, p in drift_results.items() if p is not None and p < 0.05]

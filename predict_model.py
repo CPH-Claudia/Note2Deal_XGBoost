@@ -5,26 +5,141 @@ Created on Fri Jun  6 09:34:53 2025
 @author: Z01788
 """
 
-import pickle
-import os
-import dill
-import json
-from gensim.models import Word2Vec
-import joblib
+import os, json, joblib
 import numpy as np
 import pandas as pd
+from gensim.models import Word2Vec
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, average_precision_score
 
-def load_models(model_dir="D:/備註文字探勘/models"):
-    with open(os.path.join(model_dir, "latest.json"), encoding="utf-8") as f:
+# ---------- 共用小工具 ----------
+def _get_latest_models_dir(models_root):
+    if not os.path.exists(models_root):
+        return None
+    subdirs = [d for d in os.listdir(models_root)
+               if os.path.isdir(os.path.join(models_root,d)) and len(d)>=8 and d[:8].isdigit()]
+    if not subdirs:
+        return None
+    subdirs.sort(reverse=True)
+    return os.path.join(models_root, subdirs[0])
+
+def load_models(models_root="D:/備註文字探勘/models", strategy_id=0):
+    # 先找 models/<timestamp>/latest.json，找不到再退回 models/latest.json
+    latest_json = None
+    latest_dir = _get_latest_models_dir(models_root)
+    if latest_dir and os.path.exists(os.path.join(latest_dir,"latest.json")):
+        latest_json = os.path.join(latest_dir,"latest.json")
+    elif os.path.exists(os.path.join(models_root,"latest.json")):
+        latest_json = os.path.join(models_root,"latest.json")
+    else:
+        raise FileNotFoundError("找不到 models/latest.json 或任何 timestamp 子目錄的 latest.json")
+
+    with open(latest_json,encoding="utf-8") as f:
         latest = json.load(f)
-    model = joblib.load(os.path.join(model_dir, latest["model"]))
-    w2v_model = joblib.load(os.path.join(model_dir, latest["word2vec"]))
-    tfidf = joblib.load(os.path.join(model_dir, latest["tfidf"]))
-    scaler = joblib.load(os.path.join(model_dir, latest["scaler"]))
-    features = joblib.load(os.path.join(model_dir, latest["features"]))
-    print(f"✅ 已載入模型版本：{latest['timestamp']}")
-    return model, w2v_model, tfidf, scaler, features
+
+    if "strategies" not in latest or str(strategy_id) not in latest["strategies"]:
+        raise KeyError(f"latest.json 找不到 strategy_id={strategy_id}")
+
+    # 以 latest.json 所在目錄為基準轉絕對路徑
+    base = os.path.dirname(latest_json)
+    e = latest["strategies"][str(strategy_id)]
+    def _abs(p): return p if os.path.isabs(p) else os.path.join(base,p)
+
+    model   = joblib.load(_abs(e["model"]))
+    w2v = joblib.load(_abs(e["word2vec"]))
+    tfidf   = joblib.load(_abs(e["tfidf"]))
+    scaler  = joblib.load(_abs(e["scaler"]))
+    feats   = joblib.load(_abs(e["features"]))
+    
+    w2v_idx = None
+    if "w2v_top_indices" in e and os.path.exists(e["w2v_top_indices"]):
+        try:
+            w2v_idx = joblib.load(e["w2v_top_indices"])
+        except Exception:
+            w2v_idx = None
+    
+    print(f"✅ 載入模型完成：{os.path.basename(base)}（strategy {strategy_id}）")
+    return model, w2v, tfidf, scaler, feats, w2v_idx
+
+# def _find_latest_run_dir(base_dir="D:/備註文字探勘/results"):
+#     if not os.path.isdir(base_dir):
+#         return None
+#     # 抓像 20250808_101500 這種時間字串的資料夾
+#     candidates = [d for d in os.listdir(base_dir)
+#                   if os.path.isdir(os.path.join(base_dir, d)) and d[:8].isdigit()]
+#     if not candidates:
+#         return None
+#     candidates.sort(reverse=True)  # 新的在前
+#     return os.path.join(base_dir, candidates[0])
+
+def _merge_tags_row(row, cols=("個人化標籤_背景","個人化標籤_銷售","拜訪備註_標籤")):
+    all_tags = []
+    for c in cols:
+        if c in row and pd.notna(row[c]):
+            parts = (str(row[c])
+                     .replace("，", ",")
+                     .replace("、", ",")
+                     .replace("  ", " ")
+                     .replace(" ,", ",")
+                     .split(","))
+            for tag in parts:
+                t = tag.strip().strip(".").strip("🖊️").lower()
+                if t:
+                    all_tags.append(t)
+    return list(set(all_tags))
+
+# ---------- 載模型（改版） ----------
+# def load_models(base_dir="D:/備註文字探勘/results", strategy_id=0):
+#     """
+#     從 results 底下找到「最新一批」(最新 timestamp 資料夾) 的 latest.json，
+#     然後載入該 strategy 的模型、處理器與特徵資訊。
+#     latest.json 應該長這樣：
+#     {
+#       "timestamp": "...",
+#       "strategies": {
+#         "0": {
+#           "model": "D:/.../strategy_0/model_final.pkl",
+#           "word2vec": "...",
+#           "tfidf": "...",
+#           "scaler": "...",
+#           "features": "....pkl",
+#           "train_reference": "...",
+#           "w2v_top_indices": "....pkl"   # 可選，沒有就用 fallback
+#         },
+#         "2": {...},
+#         "6": {...}
+#       }
+#     }
+#     """
+#     latest_run = _find_latest_run_dir(base_dir)
+#     if latest_run is None:
+#         raise FileNotFoundError("找不到任何 results/<timestamp>/ 資料夾")
+
+#     latest_json = os.path.join(latest_run, "latest.json")
+#     if not os.path.exists(latest_json):
+#         raise FileNotFoundError(f"找不到 latest.json: {latest_json}")
+
+#     with open(latest_json, encoding="utf-8") as f:
+#         latest = json.load(f)
+
+#     strat = latest["strategies"][str(strategy_id)]
+
+#     # 這些路徑在重訓時就寫成「完整路徑」，直接 load 即可
+#     model   = joblib.load(strat["model"])
+#     w2v     = joblib.load(strat["word2vec"])
+#     tfidf   = joblib.load(strat["tfidf"])
+#     scaler  = joblib.load(strat["scaler"])
+#     feats   = joblib.load(strat["features"])
+
+#     # 可選：w2v_top_indices
+#     w2v_idx = None
+#     if "w2v_top_indices" in strat and os.path.exists(strat["w2v_top_indices"]):
+#         try:
+#             w2v_idx = joblib.load(strat["w2v_top_indices"])
+#         except Exception:
+#             w2v_idx = None
+
+#     print(f"✅ 已載入最新模型（strategy={strategy_id}）版本：{latest['timestamp']}")
+#     return model, w2v, tfidf, scaler, feats, w2v_idx
 
 
 def classify_probability(p):
@@ -49,113 +164,105 @@ def check_success_within_30_days(row, policy_df):
     return 1 if not matched.empty else 0
 
 def evaluate_predictions(results_path, policy_df, threshold=0.6):
-    # 讀取預測結果 Excel
     results_df = pd.read_excel(results_path)
-    
-    # 時間欄位轉型
     results_df['拜訪時間 年/月/日'] = pd.to_datetime(results_df['拜訪時間 年/月/日'], errors='coerce')
     policy_df['投保日 年/月/日'] = pd.to_datetime(policy_df['投保日 年/月/日'], errors='coerce')
-    
-    # 實際成交標籤
     results_df['實際是否成交'] = results_df.apply(lambda row: check_success_within_30_days(row, policy_df), axis=1)
-    
-    # 預測標籤
-    results_df['預測是否成交'] = results_df['預測成交機率'].apply(lambda x: 1 if x >= threshold else 0)
-    
-    # 混淆矩陣與分類報告
+    results_df['預測是否成交'] = (results_df['預測成交機率'] >= threshold).astype(int)
+
     cm = confusion_matrix(results_df['實際是否成交'], results_df['預測是否成交'])
     report = classification_report(results_df['實際是否成交'], results_df['預測是否成交'], output_dict=True)
-    
-    # 儲存回 Excel
+
     with pd.ExcelWriter(results_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
         results_df.to_excel(writer, sheet_name='預測結果_已驗證', index=False)
-        
-        # 建立混淆矩陣 DataFrame
         cm_df = pd.DataFrame(cm, index=["實際:未成交", "實際:成交"], columns=["預測:未成交", "預測:成交"])
-        
-        # 建立 classification_report DataFrame
         cr_df = pd.DataFrame(report).T
-        
-        # 寫入報表
-        start_row = 0
-        cm_df.to_excel(writer, sheet_name='模型評估', startrow=start_row)
-        cr_df.to_excel(writer, sheet_name='模型評估', startrow=start_row + len(cm_df) + 3)
-
-    print(f"✅ 評估完成，結果已寫入：{results_path}")    
+        cm_df.to_excel(writer, sheet_name='模型評估', startrow=0)
+        cr_df.to_excel(writer, sheet_name='模型評估', startrow=len(cm_df) + 3)
+    print(f"✅ 評估完成，結果已寫入：{results_path}") 
 
 
-def predict_with_model(df_ready, output_path, source_file=None):
-    model, w2v_model, tfidf_vectorizer, scaler, features = load_models()
-    
-    numerical_cols = [f for f in features if not f.startswith("w2v_")]
-    w2v_indices = [int(f.split("_")[1]) for f in features if f.startswith("w2v_")]
+# ---------- 預測主流程（改版） ----------
+def predict_with_model(df_ready, output_path, source_file=None, strategy_id=0, models_root="D:/備註文字探勘/models"):
+    # 1) 讀模型與處理器（最新一批 & 指定 strategy）
+    model, w2v_model, tfidf_vectorizer, scaler, features, w2v_top_indices = load_models(models_root, strategy_id)
 
-    X_num = df_ready[numerical_cols].fillna(0)
-    X_scaled = scaler.transform(X_num)
+    # 2) 依 features 拆出 W2V / 數值 / 標籤類
+    feat_upper = [f.upper() for f in features]
+    w2v_feats   = [f for f in features if f.upper().startswith("W2V_")]
+    top_k       = len(w2v_feats)
 
+    # 數值欄位：以「features 中、且也出現在 df_ready.columns」者為準
+    numerical_cols = [f for f in features if (f not in w2v_feats) and (f in df_ready.columns)]
+
+    # 剩下的就視為 tag 類（有些策略沒有標籤，這裡就會是空 list）
+    tag_classes = [f for f in features if (f not in w2v_feats) and (f not in numerical_cols)]
+
+    # 3) 數值特徵
+    X_num = df_ready[numerical_cols].copy() if numerical_cols else pd.DataFrame(index=df_ready.index)
+    if not X_num.empty:
+        X_num = X_num.fillna(0)
+        X_scaled = scaler.transform(X_num)
+    else:
+        X_scaled = np.zeros((len(df_ready), 0))
+
+    # 4) 文字向量（加權平均）；注意要逐列處理，避免掉對齊
     tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
-    def vectorize_sentence_weighted(sentence):
+
+    def vectorize_sentence_weighted(tokens):
         vecs, weights = [], []
-        for word in sentence:
-            if word in w2v_model.wv and word in tfidf_dict:
+        for word in tokens:
+            if (word in w2v_model.wv) and (word in tfidf_dict):
                 vecs.append(w2v_model.wv[word] * tfidf_dict[word])
                 weights.append(tfidf_dict[word])
-        return np.sum(vecs, axis=0) / np.sum(weights) if vecs else np.zeros(w2v_model.vector_size)
+        if vecs:
+            return np.sum(vecs, axis=0) / np.sum(weights)
+        return np.zeros(w2v_model.vector_size)
 
-    tokens_list = df_ready['備註文字_處理'].dropna().apply(lambda x: x.split()).tolist()
-    X_w2v_all = np.array([vectorize_sentence_weighted(x) for x in tokens_list])
-    X_w2v_top = X_w2v_all[:, w2v_indices]
-    X_final = np.hstack([X_w2v_top, X_scaled])
+    tokens_series = df_ready['備註文字_處理'].fillna("").astype(str).apply(lambda x: x.split())
+    w2v_all = np.vstack([vectorize_sentence_weighted(toks) for toks in tokens_series])
 
+    # 5) 只取訓練時選過的前 top_k 維（有存 indices 則用，沒有就退而求其次用 range(top_k)）
+    if w2v_top_indices is not None:
+        X_w2v_top = w2v_all[:, w2v_top_indices]
+    else:
+        X_w2v_top = w2v_all[:, :top_k] if top_k > 0 else np.zeros((len(df_ready), 0))
+
+    # 6) 標籤類特徵（如果 features 有列出）
+    if tag_classes:
+        # 產出 merged_tags
+        merged = df_ready.apply(_merge_tags_row, axis=1)
+        # 對應成 multi-hot，tag_classes 的名稱就是 one-hot 欄位名
+        tag_index = {t: i for i, t in enumerate(tag_classes)}
+        X_tags = np.zeros((len(df_ready), len(tag_classes)), dtype=np.float32)
+        for r, tags in enumerate(merged):
+            for t in tags:
+                if t in tag_index:
+                    X_tags[r, tag_index[t]] = 1.0
+    else:
+        X_tags = np.zeros((len(df_ready), 0), dtype=np.float32)
+
+    # 7) 組合成最終特徵
+    X_final = np.hstack([X_w2v_top, X_scaled, X_tags])
+
+    # 8) 推論
     y_pred_proba = model.predict_proba(X_final)[:, 1]
     y_pred = (y_pred_proba >= 0.6).astype(int)
-    df_ready['預測成交機率'] = y_pred_proba
-    df_ready['預測成交與否'] = y_pred
 
-    # # 自動補上 label（與訓練時一致：拜訪與投保日天數差 <= 30 為成交）
-    # if "label" not in df_ready.columns and "拜訪與投保日天數差" in df_ready.columns:
-    #     df_ready["label"] = df_ready["拜訪與投保日天數差"].apply(lambda x: 1 if pd.notna(x) and x <= 30 else 0)
+    out = df_ready.copy()
+    out['預測成交機率'] = y_pred_proba
+    out['預測成交與否'] = y_pred
+    out['潛力分類'] = out['預測成交機率'].apply(classify_probability)
     
-    # # 數值特徵
-    # numerical_cols = [
-    #     '業務客戶性別組合', '最新職級', '拜訪目的', 
-    #     '平均拜訪間隔天數', '每週平均拜訪客戶數', '業務客戶年齡差距', # '拜訪紀錄密度', 
-    #     '備註字數', '有意義詞數', 
-    #     '目前年資', '營業單位_編碼', # '當年度賽季增員數', '加前一賽季增員數', '最新職級', 
-    #     '上半年準客戶數', '今年度活動參與率', '上年度FYC', '距離晉升天數', 
-    #     '件數', '總保費' # '業務客戶性別組合', 
-    # ]
-    # X_num = df_ready[numerical_cols].fillna(0)
-    # X_scaled = scaler.transform(X_num)
+    # === 建立斷詞長格式（包含預測機率）===
+    if '拜訪備註_詞語' in out.columns:
+        tokens_exploded = out[[
+            '客戶UUID', '拜訪紀錄UUID', '拜訪備註_詞語', '預測成交機率'
+        ]].explode('拜訪備註_詞語').rename(columns={'拜訪備註_詞語': '詞語'}).dropna(subset=['詞語'])
+    else:
+        tokens_exploded = pd.DataFrame()
 
-    # # TF-IDF + Word2Vec 向量
-    # def vectorize_sentence_weighted(sentence):
-    #     tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
-    #     vecs, weights = [], []
-    #     for word in sentence:
-    #         if word in w2v_model.wv and word in tfidf_dict:
-    #             vecs.append(w2v_model.wv[word] * tfidf_dict[word])
-    #             weights.append(tfidf_dict[word])
-    #     return np.sum(vecs, axis=0) / np.sum(weights) if vecs else np.zeros(w2v_model.vector_size)
-
-    # tokens_list = df_ready['拜訪備註_詞語']
-    # X_w2v = np.array([vectorize_sentence_weighted(x) for x in tokens_list])
-    
-    # w2v_feature_names = [f"w2v_{i}" for i in range(10)]
-    # num_feature_names = numerical_cols
-    # X_combined_df = pd.DataFrame(np.hstack([X_w2v[:, :10], X_scaled]), columns=w2v_feature_names + num_feature_names)
-    # X_combined_df = X_combined_df[final_feature_names]  # 根據訓練時的順序重新排列
-    # X_combined = X_combined_df.values
-
-
-    # # 合併
-    # # X_combined = np.hstack([X_scaled, X_w2v[:, :10]])
-    # y_pred_proba = model.predict_proba(X_combined)[:, 1]
-    # df_ready['預測成交機率'] = y_pred_proba
-    df_ready['潛力分類'] = df_ready['預測成交機率'].apply(classify_probability)
-    # df_ready['預測成交與否'] = (df_ready['預測成交機率'] >= 0.6).astype(int)
-
-    # 評估報告產生
+    # 9) 輸出 Excel（如有真實標籤就一起算評估）
     def generate_model_report(y_true, y_pred, y_prob):
         report_dict = classification_report(y_true, y_pred, output_dict=True)
         report_df = pd.DataFrame(report_dict).T
@@ -163,24 +270,22 @@ def predict_with_model(df_ready, output_path, source_file=None):
         report_df["PR AUC"] = average_precision_score(y_true, y_prob)
         return report_df
 
-    # ✅ 儲存為 Excel：包含預測結果 + 模型評估
+    # 一次寫同一份 Excel（含三個 Sheet：預測結果 / 斷詞長格式 / 模型評估[如有]）
     with pd.ExcelWriter(output_path, engine="openpyxl", mode="w") as writer:
-        df_ready.to_excel(writer, index=False, sheet_name="預測結果")
+        out.to_excel(writer, index=False, sheet_name="預測結果")
+        tokens_exploded.to_excel(writer, index=False, sheet_name="斷詞長格式")
 
-        if "label" in df_ready.columns:
-            eval_df = generate_model_report(
-                df_ready["label"],
-                df_ready["預測成交與否"],
-                df_ready["預測成交機率"]
-            )
+        if 'label' in out.columns:
+            eval_df = generate_model_report(out['label'], out['預測成交與否'], out['預測成交機率'])
             eval_df.to_excel(writer, sheet_name="模型評估")
-            print("✅ 評估完成，結果已寫入 Excel：", output_path)
-        else:
-            print("⚠️ 無法執行模型評估：缺少 label 欄位")
+        # else: 沒有 label 就不寫「模型評估」sheet
 
     print(f"✅ 預測完成，已儲存至：{output_path}")
-
-    # 可選的額外評估（如你有 evaluate_predictions 函數）
+    
+    # 10) （可選）如果你還要用保單做 30 天成交比對，就用 evaluate_predictions
     if source_file is not None:
-        policy_df = pd.read_excel(source_file, sheet_name="POLICY")
-        evaluate_predictions(results_path=output_path, policy_df=policy_df, threshold=0.6)
+        try:
+            policy_df = pd.read_excel(source_file, sheet_name="POLICY")
+            evaluate_predictions(results_path=output_path, policy_df=policy_df, threshold=0.6)
+        except Exception as e:
+            print(f"⚠️ 無法執行保單比對評估：{e}")

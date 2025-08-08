@@ -160,14 +160,27 @@ def full_pipeline_with_ckip(file_path):
     ]
 
     from drift_check import check_drift_and_warn, get_latest_train_reference_path
-    ref_path = get_latest_train_reference_path()
-    safe_to_predict = check_drift_and_warn(df_ready, ref_path, stop_if_drift=True)
+    # 取得「同一批次(同一timestamp)」且含三個 strategy 的參考檔路徑
+    refs = get_latest_train_reference_path(
+        base_dir="D:/備註文字探勘/models",
+        strategy_ids=(0, 2, 6),
+        require_all=True,   # 同一批次都要齊全
+        use_mtime=False     # 以資料夾名稱(時間字串)排序；要用修改時間就改 True
+    )
+    
+    safe_to_predict = check_drift_and_warn(
+        df_ready,
+        ref_source=refs,          # 直接丟 dict 進去
+        selected_cols=None,       # 用 drift_check 預設或自己傳
+        stop_if_drift=True,
+        strategy_ids=(0, 2, 6)    # 讓輸出訊息更清楚
+    )
 
     if not safe_to_predict:
         print("⚠️ 偵測到資料偏移，正在重新訓練模型...")
         from retrain_model_label import train_model_pipeline_with_strategies
         train_model_pipeline_with_strategies(df_ready, policy_df)
-        return df_ready, policy_df  # ❗ retrain 中已處理預測與輸出，這裡直接結束流程
+        return df_ready, policy_df  # retrain 中已處理預測與輸出，這裡直接結束流程
 
     # === 若無資料偏移，使用既有模型進行預測 ===
     from predict_model import predict_with_model
@@ -175,16 +188,21 @@ def full_pipeline_with_ckip(file_path):
     output_path = os.path.join(output_dir, f"results/預測_{timestamp}.xlsx")
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     predict_with_model(df_ready, output_path, source_file=file_path)
+    
+    from predict_model import predict_with_model
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    strategy_ids = [0, 2, 6]   # 想跑哪幾個就在這裡改
+    out_dir = os.path.join("D:/備註文字探勘/results", timestamp)
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, f"預測_{timestamp}.xlsx")
+    
+    for sid in strategy_ids:
+        predict_with_model(df_ready, output_path, strategy_id=sid, models_root="D:/備註文字探勘/models")
+        # out_path = os.path.join(output_dir, f"results/預測_{timestamp}_{sid}.xlsx")
+        # os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        # predict_with_model(df_ready, out_path, source_file=file_path, strategy_id=sid)
 
-    # === 建立斷詞長格式（包含預測機率）===
-    tokens_exploded = df_ready[[
-        '客戶UUID', '拜訪紀錄UUID', '拜訪備註_詞語', '預測成交機率'
-    ]].explode('拜訪備註_詞語').rename(columns={'拜訪備註_詞語': '詞語'}).dropna(subset=['詞語'])
-
-    with pd.ExcelWriter(output_path, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        tokens_exploded.to_excel(writer, index=False, sheet_name="斷詞長格式")
-
-    print("✅ 模型預測完成，結果輸出：", output_path)
     return df_ready, policy_df
 
 

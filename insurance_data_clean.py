@@ -83,7 +83,7 @@ def clean_visit(file_path):
             return '非賽季'
     
     visit['賽季'] = visit['拜訪時間 年/月/日'].apply(classify_season)
-    season_map = {'無賽季': 0, '夏賽': 1, '冬賽': 2}
+    season_map = {'非賽季': 0, '夏賽': 1, '冬賽': 2}
     visit['賽季'] = visit['賽季'].map(season_map)
 
     return visit
@@ -330,7 +330,7 @@ def prepare_model_dataset(file_path):
     
     # 套用到 visit_df
     visit_df[['最近晉升日_dt', '距離最近晉升天數']] = visit_df.apply(find_nearest_promotion, axis=1)
-    visit_df['距離最近晉升天數'] = visit_df['距離最近晉升天數'].fillna(0)
+    # visit_df['距離最近晉升天數'] = visit_df['距離最近晉升天數'].fillna(0)
     
     # # 合併 MEMBER 增員數
     # visit_df = visit_df.merge(member_df, on='業代', how='left')

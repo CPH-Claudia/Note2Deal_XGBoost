@@ -23,6 +23,106 @@ import matplotlib.pyplot as plt
 plt.rc('font', family = 'Microsoft JhengHei')
 plt.rcParams['axes.unicode_minus'] = False 
 
+def add_shap_positive_hits(df_combined, summary_df, numerical_cols):
+    """
+    將每筆拜訪資料標註：各數值變數是否「命中 SHAP 正向區間」(1/0)。
+    需要的欄位命名：summary_df 內用『變數』『原始值區間_起』『原始值區間_迄』
+    df_combined 內對應同名的數值欄位（原始值，非標準化）。
+    """
+    if summary_df is None or summary_df.empty:
+        return df_combined
+
+    # 建立：變數 -> [(lo, hi), ...] 的區間字典
+    pos_ranges = (
+        summary_df[["變數", "原始值區間_起", "原始值區間_迄"]]
+        .dropna(subset=["變數"])
+        .groupby("變數")[["原始值區間_起", "原始值區間_迄"]]
+        .apply(lambda g: list(map(tuple, g.values)))
+        .to_dict()
+    )
+
+    # 逐變數打標
+    import numpy as np
+    for var, ranges in pos_ranges.items():
+        if var not in df_combined.columns:
+            continue
+        x = pd.to_numeric(df_combined[var], errors="coerce").values
+        hit = np.zeros(len(df_combined), dtype=bool)
+        for lo, hi in ranges:
+            lo_val = -np.inf if pd.isna(lo) else lo
+            hi_val =  np.inf if pd.isna(hi) else hi
+            hit |= (x >= lo_val) & (x <= hi_val)
+        df_combined[f"{var}_正向"] = hit.astype(int)
+
+    # （可選）統計每筆命中了幾個變數
+    hit_cols = [f"{v}_正向" for v in numerical_cols if f"{v}_正向" in df_combined.columns]
+    if hit_cols:
+        df_combined["正向變數數量"] = df_combined[hit_cols].sum(axis=1)
+    return df_combined
+
+def add_positive_visit_counts(summary_df, df_all, numerical_cols,
+                              source_col=None, train_flag_value=0, holdout_flag_value=1):
+    """
+    summary_df: 由 plot_shap_bin_auto_with_summary_dual_x 回傳（含 變數、原始值區間_起/迄）
+    df_all:     你要用來計數的資料（建議用 df_combined，含 train + holdout）
+    numerical_cols: 只處理這些數值欄
+    source_col: 若提供（如 "is_holdout"），會另外算出 train/holdout 拆分的數量
+    """
+    out = summary_df.copy()
+    out["正向拜訪數"] = 0
+    out["樣本數"] = 0
+    out["正向占比"] = np.nan
+
+    # 若要拆 train/holdout
+    if source_col is not None:
+        out["正向拜訪數_train"] = 0
+        out["樣本數_train"] = 0
+        out["正向占比_train"] = np.nan
+        out["正向拜訪數_holdout"] = 0
+        out["樣本數_holdout"] = 0
+        out["正向占比_holdout"] = np.nan
+
+    for idx, r in out.iterrows():
+        var = r["變數"]
+        if var not in numerical_cols:
+            continue
+
+        lo = r["原始值區間_起"]
+        hi = r["原始值區間_迄"]
+
+        # 容忍無窮界
+        lo_eff = -np.inf if pd.isna(lo) else lo
+        hi_eff =  np.inf if pd.isna(hi) else hi
+
+        col = df_all[var]
+        total = col.notna().sum()
+        hit_mask = col.between(lo_eff, hi_eff, inclusive="both")
+        hit = hit_mask.sum()
+
+        out.at[idx, "正向拜訪數"] = int(hit)
+        out.at[idx, "樣本數"] = int(total)
+        out.at[idx, "正向占比"] = round(hit / total, 4) if total > 0 else np.nan
+
+        if source_col is not None:
+            tr = df_all[df_all[source_col] == train_flag_value][var]
+            te = df_all[df_all[source_col] == holdout_flag_value][var]
+
+            tr_tot = tr.notna().sum()
+            te_tot = te.notna().sum()
+            tr_hit = tr.between(lo_eff, hi_eff, inclusive="both").sum()
+            te_hit = te.between(lo_eff, hi_eff, inclusive="both").sum()
+
+            out.at[idx, "正向拜訪數_train"] = int(tr_hit)
+            out.at[idx, "樣本數_train"] = int(tr_tot)
+            out.at[idx, "正向占比_train"] = round(tr_hit / tr_tot, 4) if tr_tot > 0 else np.nan
+
+            out.at[idx, "正向拜訪數_holdout"] = int(te_hit)
+            out.at[idx, "樣本數_holdout"] = int(te_tot)
+            out.at[idx, "正向占比_holdout"] = round(te_hit / te_tot, 4) if te_tot > 0 else np.nan
+
+    return out
+
+
 def plot_shap_bin_auto_with_summary_dual_x(
     X_data, shap_values, feature_names, variables,
     mean_dict, scale_dict,
@@ -150,20 +250,21 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
     all_summary_dfs = []          # 累積每個 strategy 的 SHAP 區間 DataFrame（summary_df）
 
     
-    # 建立斷詞語料（用整份 df_ready）
-    df_model = df_ready.copy()
-    token_lists_all = df_model['備註文字_處理'].dropna().apply(lambda x: x.split()).tolist()
-    corpus_text_all = df_model["備註文字_處理"].dropna().apply(lambda x: " ".join(x.split()))
+    # # 建立斷詞語料（用整份 df_ready）
+    # df_model = df_ready.copy()
+    # token_lists_all = df_model['備註文字_處理'].dropna().apply(lambda x: x.split()).tolist()
+    # corpus_text_all = df_model["備註文字_處理"].dropna().apply(lambda x: " ".join(x.split()))
     
-    # === Word2Vec 模型訓練 ===
-    w2v_model = Word2Vec(sentences=token_lists_all, vector_size=100, window=5, min_count=1, workers=4)
+    # # === Word2Vec 模型訓練 ===
+    # w2v_model = Word2Vec(sentences=token_lists_all, vector_size=100, window=5, min_count=1, workers=4)
     
-    # === TF-IDF 建立 ===
-    tfidf_vectorizer = TfidfVectorizer()
-    tfidf_vectorizer.fit(corpus_text_all)
-    tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
+    # # === TF-IDF 建立 ===
+    # tfidf_vectorizer = TfidfVectorizer()
+    # tfidf_vectorizer.fit(corpus_text_all)
+    # tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
 
     for strategy_id in strategy_ids:
+        df_model = df_ready.copy()
         df_model = df_model[df_model['平均每客戶拜訪次數'] > 4].copy()
         
         # === 檢查必要欄位是否存在，若無則補上處理 ===
@@ -194,37 +295,95 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         )
         df_model["tfidf_weights"] = df_model['備註文字_處理'].apply(lambda x: [tfidf_dict.get(w, 0) for w in x.split()] if pd.notna(x) else [])
 
+        # ==========================================
+        # 依 strategy_id 決定 tag 欄位與過濾條件
+        # ==========================================
         
         
-        tag_cols = []
-        if strategy_id in [1, 2, 5, 6]:
-            tag_cols.extend(['個人化標籤_背景', '個人化標籤_銷售'])
-        if strategy_id in [3, 4, 5, 6]:
-            tag_cols.append('拜訪備註_標籤')
-        if strategy_id == 7:
+        # 依 strategy_id 決定要合併的欄位
+        if strategy_id == 0:
+            tag_cols = []
+        elif strategy_id == 1:
+            tag_cols = ['個人化標籤_背景', '個人化標籤_銷售']
+        elif strategy_id == 2:
+            tag_cols = ['個人化標籤_背景', '個人化標籤_銷售']
+        elif strategy_id == 3:
+            tag_cols = ['拜訪備註_標籤']
+        elif strategy_id == 4:
+            tag_cols = ['拜訪備註_標籤']
+        elif strategy_id == 5:
             tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
+        elif strategy_id == 6:
+            tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
+        elif strategy_id == 7:
+            tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
+        else:
+            tag_cols = []
         
-        def merge_tags(row):
-            all_tags = []
-            for col in tag_cols:
-                if pd.notna(row[col]):
-                    parts = str(row[col]).replace("，", ",").replace("、", ",").replace("  ", " ").replace(" ,", ",").split(",")
-                    for tag in parts:
-                        tag_clean = tag.strip().strip(".").strip("🖊️").lower()
-                        if tag_clean:
-                            all_tags.append(tag_clean)
-            return list(set(all_tags))
-
+        # 標籤清理函式
+        def split_tags(val):
+            if pd.isna(val):
+                return []
+            s = str(val).replace("，", ",").replace("、", ",").replace("  ", " ").replace(" ,", ",")
+            parts = [p.strip().strip(".").strip("🖊️").lower() for p in s.split(",")]
+            return [p for p in parts if p]
+        
+        # 合併標籤
         if tag_cols:
-            df_model["merged_tags"] = df_model.apply(merge_tags, axis=1)
+            df_model["merged_tags"] = df_model.apply(
+                lambda r: sorted(set(sum([split_tags(r.get(c, None)) for c in tag_cols], []))),
+                axis=1
+            )
         else:
             df_model["merged_tags"] = [[] for _ in range(len(df_model))]
         
-        if strategy_id in [2, 4, 6, 7]:
-            valid_mask = df_model["merged_tags"].apply(lambda x: len(x) > 0)
-            df_model = df_model[valid_mask]
+        # 篩選條件
+        if strategy_id in [2, 4, 6]:
+            # 需要任一欄位非空
+            df_model = df_model[df_model["merged_tags"].apply(lambda x: len(x) > 0)].reset_index(drop=True)
         
-        print("🔍 merged_tags 非空筆數：", df_model["merged_tags"].apply(lambda x: len(x) > 0).sum())
+        elif strategy_id == 7:
+            # 個人化標籤 與 拜訪備註_標籤 都要有值
+            has_personal = df_model[['個人化標籤_背景','個人化標籤_銷售']].apply(
+                lambda r: any(len(split_tags(r.get(c))) > 0 for c in ['個人化標籤_背景','個人化標籤_銷售']),
+                axis=1
+            )
+            has_visit = df_model['拜訪備註_標籤'].apply(lambda v: len(split_tags(v)) > 0)
+            df_model = df_model[has_personal & has_visit].reset_index(drop=True)
+        
+        # Debug 訊息
+        print(f"[strategy {strategy_id}] merged_tags 非空筆數：{(df_model['merged_tags'].apply(len) > 0).sum()} / 總樣本數：{len(df_model)}")
+
+        
+        # tag_cols = []
+        # if strategy_id in [1, 2, 5, 6]:
+        #     tag_cols.extend(['個人化標籤_背景', '個人化標籤_銷售'])
+        # if strategy_id in [3, 4, 5, 6]:
+        #     tag_cols.append('拜訪備註_標籤')
+        # if strategy_id == 7:
+        #     tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
+        
+        # def merge_tags(row):
+        #     all_tags = []
+        #     for col in tag_cols:
+        #         if pd.notna(row[col]):
+        #             parts = str(row[col]).replace("，", ",").replace("、", ",").replace("  ", " ").replace(" ,", ",").split(",")
+        #             for tag in parts:
+        #                 tag_clean = tag.strip().strip(".").strip("🖊️").lower()
+        #                 if tag_clean:
+        #                     all_tags.append(tag_clean)
+        #     return list(set(all_tags))
+
+        # if tag_cols:
+        #     df_model["merged_tags"] = df_model.apply(merge_tags, axis=1)
+        # else:
+        #     df_model["merged_tags"] = [[] for _ in range(len(df_model))]
+        
+        # if strategy_id in [2, 4, 6, 7]:
+        #     valid_mask = df_model["merged_tags"].apply(lambda x: len(x) > 0)
+        #     df_model = df_model[valid_mask]
+        
+        # print(f"[strategy {strategy_id}] merged_tags 非空筆數：", df_model["merged_tags"].apply(lambda x: len(x) > 0).sum())
 
         # --- 2. 切分 Train / Holdout ---
         df_model = df_model.sample(frac=1, random_state=42).reset_index(drop=True)
@@ -242,9 +401,22 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
             '上半年準客戶數', '最近半年活動參與率', '上一個半年度FYC', '距離最近晉升天數',
             '件數', '總保費', '拜訪序號', '賽季'
         ]
+
+
         X_num = df_train[numerical_cols].copy()
-        scaler = StandardScaler()
-        X_num_scaled = scaler.fit_transform(X_num)
+        # scaler = StandardScaler()
+        # X_num_scaled = scaler.fit_transform(X_num)
+        
+        # 取訓練集統計量（跳過 NaN）
+        means = df_train[numerical_cols].mean(skipna=True)
+        stds  = df_train[numerical_cols].std(skipna=True).replace(0, 1)  # 避免除以 0
+        
+        def scale_keep_nan(df_subset):
+            X_num = df_subset[numerical_cols].copy()
+            # 手動標準化：NaN 會原樣保留
+            X_scaled = (X_num - means) / stds
+            return X_scaled.values  # 之後和 W2V / tag 特徵 hstack
+        X_num_scaled = scale_keep_nan(X_num)
     
         w2v_vectors = df_train["w2v_vector"].to_list()
         X_w2v_weighted = []
@@ -299,7 +471,8 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         #     return final_features
         def prepare_features(df_subset, return_feature_names=False):
             X_num = df_subset[numerical_cols].copy()
-            X_scaled = scaler.transform(X_num)
+            # X_scaled = scaler.transform(X_num)
+            X_scaled = scale_keep_nan(df_subset)
             
             w2v_vectors = df_subset["w2v_vector"].to_list()
             X_w2v_weighted = []
@@ -519,6 +692,14 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
                 )
                 summary_df.insert(0, "timestamp", timestamp)
                 summary_df.insert(1, "strategy_id", strategy_id)
+                
+                # ⭐ 在這裡加：用 train+holdout 的 df_combined 去數每段區間的拜訪數
+                summary_df = add_positive_visit_counts(
+                    summary_df, df_combined, numerical_cols,
+                    source_col="is_holdout",  # 有這欄就會同時計算 train/holdout 拆分
+                    train_flag_value=0, holdout_flag_value=1
+                )
+                
                 all_summary_dfs.append(summary_df)
         
                 print(f"✅ SHAP 圖片與區間已儲存：strategy {strategy_id}")
@@ -526,6 +707,9 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
             except Exception as e:
                 if debug_mode:
                     print(f"❌ SHAP 分析失敗(strategy {strategy_id})：{e}")
+                    
+        # === 依 SHAP 正向區間，為每筆資料標註「正向」欄位 ===
+        df_combined = add_shap_positive_hits(df_combined, summary_df, numerical_cols)
                     
 
 
@@ -641,7 +825,7 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         print(f"✅ 模型 {strategy_id} 資料儲存至：{single_path}")
     
         # 2) 全部策略彙整檔（追加寫入同一份）
-        aggregate_path = os.path.join(results_dir, "ALL_strategies_results.xlsx")
+        aggregate_path = os.path.join(results_dir, f"ALL_strategies_results_{timestamp}.xlsx")
     
         def _append_sheet(agg_path, sheet_name, new_df):
             if os.path.exists(agg_path):
@@ -676,10 +860,11 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
             "test_pos_ratio": round(df_holdout_["label"].mean(), 4),
             "cv_roc_auc": np.mean(roc_scores),
             "cv_pr_auc": np.mean(pr_scores),
-            "test_roc_auc": average_precision_score(df_holdout_["label"], df_holdout_["pred_prob"]),  # 你可改回 roc_auc_score
+            "test_roc_auc": roc_auc_score(df_holdout_["label"], df_holdout_["pred_prob"]),  # 你可改回 roc_auc_score
             "test_pr_auc": average_precision_score(df_holdout_["label"], df_holdout_["pred_prob"])
         }
         all_monitoring_rows.append(monitoring_row)
+        
         
         # # --- 監控合併寫到 results/<timestamp>/model_monitoring.xlsx ---
         # mon_path=os.path.join(results_dir,"model_monitoring.xlsx")

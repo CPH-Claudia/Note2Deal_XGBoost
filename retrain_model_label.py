@@ -23,42 +23,127 @@ import matplotlib.pyplot as plt
 plt.rc('font', family = 'Microsoft JhengHei')
 plt.rcParams['axes.unicode_minus'] = False 
 
-def add_shap_positive_hits(df_combined, summary_df, numerical_cols):
-    """
-    將每筆拜訪資料標註：各數值變數是否「命中 SHAP 正向區間」(1/0)。
-    需要的欄位命名：summary_df 內用『變數』『原始值區間_起』『原始值區間_迄』
-    df_combined 內對應同名的數值欄位（原始值，非標準化）。
-    """
-    if summary_df is None or summary_df.empty:
-        return df_combined
 
-    # 建立：變數 -> [(lo, hi), ...] 的區間字典
-    pos_ranges = (
-        summary_df[["變數", "原始值區間_起", "原始值區間_迄"]]
-        .dropna(subset=["變數"])
-        .groupby("變數")[["原始值區間_起", "原始值區間_迄"]]
-        .apply(lambda g: list(map(tuple, g.values)))
-        .to_dict()
-    )
+def add_shap_positive_hits(df_combined, summary_df, variables, 
+                           ts_col="timestamp", sid_col="strategy_id"):
+    # ... 省略前段過濾 summary_df 的邏輯 ...
 
-    # 逐變數打標
-    import numpy as np
-    for var, ranges in pos_ranges.items():
+    # 用來收集「所有變數的所有新欄位」
+    new_cols_all = {}
+
+    for var in variables:
         if var not in df_combined.columns:
             continue
-        x = pd.to_numeric(df_combined[var], errors="coerce").values
-        hit = np.zeros(len(df_combined), dtype=bool)
-        for lo, hi in ranges:
-            lo_val = -np.inf if pd.isna(lo) else lo
-            hi_val =  np.inf if pd.isna(hi) else hi
-            hit |= (x >= lo_val) & (x <= hi_val)
-        df_combined[f"{var}_正向"] = hit.astype(int)
 
-    # （可選）統計每筆命中了幾個變數
-    hit_cols = [f"{v}_正向" for v in numerical_cols if f"{v}_正向" in df_combined.columns]
-    if hit_cols:
-        df_combined["正向變數數量"] = df_combined[hit_cols].sum(axis=1)
+        sub = summary_df[summary_df["變數"] == var].copy()
+        if sub.empty:
+            n = len(df_combined)
+            new_cols_all[f"{var}_命中"]      = np.zeros(n, dtype=np.int8)
+            new_cols_all[f"{var}_距離前"]    = np.full(n, np.nan)
+            new_cols_all[f"{var}_距離後"]    = np.full(n, np.nan)
+            new_cols_all[f"{var}_距離最近"]  = np.full(n, np.nan)
+            new_cols_all[f"{var}_最近區間_起"] = np.full(n, np.nan)
+            new_cols_all[f"{var}_最近區間_迄"] = np.full(n, np.nan)
+            continue
+
+        sub = sub.dropna(subset=["原始值區間_起", "原始值區間_迄"]).drop_duplicates(
+            subset=["原始值區間_起", "原始值區間_迄"]
+        ).sort_values(["原始值區間_起", "原始值區間_迄"])
+        lo = sub["原始值區間_起"].to_numpy(float)
+        hi = sub["原始值區間_迄"].to_numpy(float)
+
+        vals = df_combined[var].to_numpy()
+        n = len(vals)
+        hit       = np.zeros(n, dtype=np.int8)
+        dist_prev = np.full(n, np.nan)
+        dist_next = np.full(n, np.nan)
+        dist_near = np.full(n, np.nan)
+        near_lo   = np.full(n, np.nan)
+        near_hi   = np.full(n, np.nan)
+
+        for i, v in enumerate(vals):
+            if pd.isna(v):
+                continue
+            idx_next = np.searchsorted(lo, v, side="left")
+            idx_prev = idx_next - 1
+            in_prev = (idx_prev >= 0 and v >= lo[idx_prev] and v <= hi[idx_prev])
+            if in_prev:
+                hit[i] = 1
+                dist_prev[i] = dist_next[i] = dist_near[i] = 0.0
+                near_lo[i], near_hi[i] = lo[idx_prev], hi[idx_prev]
+                continue
+            # not hit → 距離前/後段（保留原非負距離以便比較）
+            dist_prev_raw = np.nan
+            dist_next_raw = np.nan
+            near_lo_prev = near_hi_prev = np.nan
+            near_lo_next = near_hi_next = np.nan
+    
+            if idx_prev >= 0:
+                d = v - hi[idx_prev]           # v 位於前一段右側 → 正數
+                dist_prev_raw = max(d, 0.0)
+                near_lo_prev, near_hi_prev = lo[idx_prev], hi[idx_prev]
+    
+            if idx_next < len(lo):
+                d = lo[idx_next] - v           # v 位於下一段左側 → 正數
+                dist_next_raw = max(d, 0.0)
+                near_lo_next, near_hi_next = lo[idx_next], hi[idx_next]
+    
+            # 取最近距離並加上方向符號：
+            # - 靠近「下一段」→ v 偏低，應往上 → 距離最近 設為負值
+            # - 靠近「前一段」→ v 偏高，應往下 → 距離最近 設為正值
+            if not pd.isna(dist_prev_raw) and not pd.isna(dist_next_raw):
+                if dist_next_raw < dist_prev_raw:
+                    dist_near[i] = -dist_next_raw
+                    near_lo[i], near_hi[i] = near_lo_next, near_hi_next
+                else:
+                    dist_near[i] = +dist_prev_raw
+                    near_lo[i], near_hi[i] = near_lo_prev, near_hi_prev
+            elif not pd.isna(dist_next_raw):
+                dist_near[i] = -dist_next_raw
+                near_lo[i], near_hi[i] = near_lo_next, near_hi_next
+            elif not pd.isna(dist_prev_raw):
+                dist_near[i] = +dist_prev_raw
+                near_lo[i], near_hi[i] = near_lo_prev, near_hi_prev
+            # 兩者皆 NaN 則保持 NaN（極端情況）
+            # # not hit → 距離前/後段
+            # if idx_prev >= 0:
+            #     d = v - hi[idx_prev]
+            #     dist_prev[i] = max(d, 0.0)
+            #     near_lo_prev, near_hi_prev = lo[idx_prev], hi[idx_prev]
+            # else:
+            #     near_lo_prev = near_hi_prev = np.nan
+
+            # if idx_next < len(lo):
+            #     d = lo[idx_next] - v
+            #     dist_next[i] = max(d, 0.0)
+            #     near_lo_next, near_hi_next = lo[idx_next], hi[idx_next]
+            # else:
+            #     near_lo_next = near_hi_next = np.nan
+
+            # # 最近
+            # cand = []
+            # if not pd.isna(dist_prev[i]): cand.append((dist_prev[i], near_lo_prev, near_hi_prev))
+            # if not pd.isna(dist_next[i]): cand.append((dist_next[i], near_lo_next, near_hi_next))
+            # if cand:
+            #     d_best, l_best, h_best = min(cand, key=lambda x: x[0])
+            #     dist_near[i], near_lo[i], near_hi[i] = d_best, l_best, h_best
+
+        # 改成一次性收集欄位
+        new_cols_all[f"{var}_命中"]        = hit
+        new_cols_all[f"{var}_距離前"]      = dist_prev
+        new_cols_all[f"{var}_距離後"]      = dist_next
+        new_cols_all[f"{var}_距離最近"]    = dist_near
+        new_cols_all[f"{var}_最近區間_起"] = near_lo
+        new_cols_all[f"{var}_最近區間_迄"] = near_hi
+
+    # 一次 concat，避免碎片化
+    if new_cols_all:
+        df_combined = pd.concat([df_combined, pd.DataFrame(new_cols_all, index=df_combined.index)], axis=1)
+        # 可選：去碎片
+        df_combined = df_combined.copy()
+
     return df_combined
+
 
 def add_positive_visit_counts(summary_df, df_all, numerical_cols,
                               source_col=None, train_flag_value=0, holdout_flag_value=1):
@@ -121,6 +206,136 @@ def add_positive_visit_counts(summary_df, df_all, numerical_cols,
             out.at[idx, "正向占比_holdout"] = round(te_hit / te_tot, 4) if te_tot > 0 else np.nan
 
     return out
+
+# def build_heatmap_long(df_combined, variables, id_cols=None):
+#     """
+#     將 df_combined 內的 {變數}_命中 / {變數}_距離 轉為直向表。
+#     variables: 要展開的變數名稱清單（通常是 numerical_cols）
+#     id_cols:   要保留的識別欄位，預設會自動擷取能找到的欄位
+#     """
+#     if id_cols is None:
+#         id_cols = [c for c in ["timestamp","strategy_id","客戶UUID","拜訪紀錄UUID",
+#                                "is_holdout","label","pred_prob"]
+#                    if c in df_combined.columns]
+
+#     pieces = []
+#     for var in variables:
+#         hit_col = f"{var}_命中"
+#         if hit_col not in df_combined.columns:
+#             # 沒有命中欄位就略過（避免報錯）
+#             continue
+#         dist_col = f"{var}_距離最近"
+
+#         keep = id_cols + [hit_col]
+#         if dist_col in df_combined.columns:
+#             keep += [dist_col]
+
+#         tmp = df_combined[keep].copy()
+#         tmp.rename(columns={hit_col:"命中"}, inplace=True)
+#         if dist_col in tmp.columns:
+#             tmp.rename(columns={dist_col:"距離"}, inplace=True)
+#         else:
+#             tmp["距離"] = np.nan
+
+#         tmp["變數"] = var
+#         tmp["命中"] = tmp["命中"].astype("Int64")
+#         pieces.append(tmp)
+
+#     if pieces:
+#         return pd.concat(pieces, ignore_index=True)
+#     else:
+#         # 若一個都沒有，回傳空 DF（避免 None）
+#         return pd.DataFrame(columns=(id_cols+["命中","距離","變數"]))
+
+import math
+
+def build_heatmap_long(
+    df_combined: pd.DataFrame,
+    variables: list,
+    id_cols: list = None,
+    ts_col: str = "timestamp",
+    sid_col: str = "strategy_id",
+    hit_suffixes=("_命中", "_距離最近", "_最近方向", "_最近區間_起", "_最近區間_迄"),
+) -> pd.DataFrame:
+    """
+    將 df_combined 內各變數的 SHAP 命中/距離資訊轉成直向表給 Tableau 熱力圖使用。
+    會先一次性補齊缺欄位以避免 DataFrame fragmentation 警告。
+    """
+    if id_cols is None:
+        # 盡量保留能辨識該拜訪紀錄的欄位（存在才放）
+        id_candidates = [ts_col, sid_col, "客戶UUID", "拜訪紀錄UUID", "is_holdout"]
+        id_cols = [c for c in id_candidates if c in df_combined.columns]
+
+    # === 1) 一次性建立缺少的欄位，避免逐欄賦值造成 fragmentation ===
+    missing_cols = {}
+    for var in variables:
+        cols_needed = {
+            "原始值": var,
+            "命中": f"{var}{hit_suffixes[0]}",
+            "距離最近": f"{var}{hit_suffixes[1]}",
+            "最近方向": f"{var}{hit_suffixes[2]}",
+            "最近區間_起": f"{var}{hit_suffixes[3]}",
+            "最近區間_迄": f"{var}{hit_suffixes[4]}",
+        }
+        # 如果原始值欄位不存在，不補（因為這就是變數本身）
+        # 其他 SHAP 衍生欄位若不存在就補預設
+        for alias, realcol in cols_needed.items():
+            if realcol not in df_combined.columns:
+                if alias == "命中":
+                    # 命中預設 0
+                    missing_cols[realcol] = pd.Series(0, index=df_combined.index)
+                elif alias != "原始值":
+                    # 其餘預設 NaN
+                    missing_cols[realcol] = pd.Series(np.nan, index=df_combined.index)
+    if missing_cols:
+        df_combined = pd.concat([df_combined, pd.DataFrame(missing_cols)], axis=1)
+
+    # === 2) 建直向表 ===
+    long_parts = []
+    for var in variables:
+        base_cols = {
+            "原始值": var,
+            "命中": f"{var}{hit_suffixes[0]}",
+            "距離最近": f"{var}{hit_suffixes[1]}",
+            "最近方向": f"{var}{hit_suffixes[2]}",
+            "最近區間_起": f"{var}{hit_suffixes[3]}",
+            "最近區間_迄": f"{var}{hit_suffixes[4]}",
+        }
+        # 確保存在（萬一 variables 有不存在於 df 的欄位就跳過）
+        if base_cols["原始值"] not in df_combined.columns:
+            continue
+
+        select_cols = id_cols + list(base_cols.values())
+        tmp = df_combined[select_cols].copy()
+
+        # 攤平成統一欄名
+        tmp = tmp.rename(columns={
+            base_cols["原始值"]: "原始值",
+            base_cols["命中"]: "命中",
+            base_cols["距離最近"]: "距離最近",
+            base_cols["最近方向"]: "最近方向",
+            base_cols["最近區間_起"]: "最近區間_起",
+            base_cols["最近區間_迄"]: "最近區間_迄",
+        })
+        tmp["變數"] = var
+        # 命中轉成 tiny int（若你希望純 0/1）
+        if "命中" in tmp.columns:
+            tmp["命中"] = tmp["命中"].astype("Int8")
+
+        long_parts.append(tmp)
+
+    if not long_parts:
+        return pd.DataFrame(columns=id_cols + ["變數", "原始值", "命中", "距離最近", "最近方向", "最近區間_起", "最近區間_迄"])
+
+    heatmap_long = pd.concat(long_parts, ignore_index=True)
+
+    # 欄位順序美化
+    front = [c for c in [ts_col, sid_col, "客戶UUID", "拜訪紀錄UUID", "is_holdout", "label", "pred_prob"] if c in heatmap_long.columns]
+    cols = front + ["變數", "原始值", "命中", "距離最近", "最近方向", "最近區間_起", "最近區間_迄"]
+    heatmap_long = heatmap_long[cols]
+
+    return heatmap_long
+
 
 
 def plot_shap_bin_auto_with_summary_dual_x(
@@ -248,20 +463,8 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
     strategy_ids = [0, 2, 6]
     all_monitoring_rows = []      # 累積每個 strategy 的 monitoring_row
     all_summary_dfs = []          # 累積每個 strategy 的 SHAP 區間 DataFrame（summary_df）
+    all_heatmap_longs = []
 
-    
-    # # 建立斷詞語料（用整份 df_ready）
-    # df_model = df_ready.copy()
-    # token_lists_all = df_model['備註文字_處理'].dropna().apply(lambda x: x.split()).tolist()
-    # corpus_text_all = df_model["備註文字_處理"].dropna().apply(lambda x: " ".join(x.split()))
-    
-    # # === Word2Vec 模型訓練 ===
-    # w2v_model = Word2Vec(sentences=token_lists_all, vector_size=100, window=5, min_count=1, workers=4)
-    
-    # # === TF-IDF 建立 ===
-    # tfidf_vectorizer = TfidfVectorizer()
-    # tfidf_vectorizer.fit(corpus_text_all)
-    # tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
 
     for strategy_id in strategy_ids:
         df_model = df_ready.copy()
@@ -355,36 +558,6 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         print(f"[strategy {strategy_id}] merged_tags 非空筆數：{(df_model['merged_tags'].apply(len) > 0).sum()} / 總樣本數：{len(df_model)}")
 
         
-        # tag_cols = []
-        # if strategy_id in [1, 2, 5, 6]:
-        #     tag_cols.extend(['個人化標籤_背景', '個人化標籤_銷售'])
-        # if strategy_id in [3, 4, 5, 6]:
-        #     tag_cols.append('拜訪備註_標籤')
-        # if strategy_id == 7:
-        #     tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
-        
-        # def merge_tags(row):
-        #     all_tags = []
-        #     for col in tag_cols:
-        #         if pd.notna(row[col]):
-        #             parts = str(row[col]).replace("，", ",").replace("、", ",").replace("  ", " ").replace(" ,", ",").split(",")
-        #             for tag in parts:
-        #                 tag_clean = tag.strip().strip(".").strip("🖊️").lower()
-        #                 if tag_clean:
-        #                     all_tags.append(tag_clean)
-        #     return list(set(all_tags))
-
-        # if tag_cols:
-        #     df_model["merged_tags"] = df_model.apply(merge_tags, axis=1)
-        # else:
-        #     df_model["merged_tags"] = [[] for _ in range(len(df_model))]
-        
-        # if strategy_id in [2, 4, 6, 7]:
-        #     valid_mask = df_model["merged_tags"].apply(lambda x: len(x) > 0)
-        #     df_model = df_model[valid_mask]
-        
-        # print(f"[strategy {strategy_id}] merged_tags 非空筆數：", df_model["merged_tags"].apply(lambda x: len(x) > 0).sum())
-
         # --- 2. 切分 Train / Holdout ---
         df_model = df_model.sample(frac=1, random_state=42).reset_index(drop=True)
         cutoff = int(len(df_model) * 0.8)
@@ -446,33 +619,10 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         mlb.fit(df_train["merged_tags"])
         
         # --- 5. Feature Preparation Function ---
-        # def prepare_features(df_subset):
-        #     X_num = df_subset[numerical_cols].copy()
-        #     X_scaled = scaler.transform(X_num)
-        #     w2v_vectors = df_subset["w2v_vector"].to_list()
-        #     X_w2v_weighted = []
-        #     for vecs in w2v_vectors:
-        #         if isinstance(vecs, list) and len(vecs) > 0:
-        #             try:
-        #                 weighted_vec = np.mean(vecs, axis=0)
-        #             except Exception:
-        #                 weighted_vec = np.zeros(100)
-        #         else:
-        #             weighted_vec = np.zeros(100)
-        #         X_w2v_weighted.append(weighted_vec)
-        #     X_w2v_weighted = np.array(X_w2v_weighted)
-        #     X_w2v_top_subset = X_w2v_weighted[:, w2v_top_indices]
-    
-        #     final_features = np.hstack([X_w2v_top_subset, X_scaled])
-    
-        #     if tag_cols:
-        #         tags_trans = mlb.transform(df_subset["merged_tags"])
-        #         final_features = np.hstack([final_features, tags_trans])
-        #     return final_features
         def prepare_features(df_subset, return_feature_names=False):
             X_num = df_subset[numerical_cols].copy()
             # X_scaled = scaler.transform(X_num)
-            X_scaled = scale_keep_nan(df_subset)
+            X_scaled = scale_keep_nan(X_num)
             
             w2v_vectors = df_subset["w2v_vector"].to_list()
             X_w2v_weighted = []
@@ -490,6 +640,7 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         
             # === 合併所有特徵 ===
             final_features = np.hstack([X_w2v_top_subset, X_scaled])
+            final_features = final_features.astype(np.float32, copy=False)
         
             final_feature_names = [
                 f"w2v_{i}" for i in w2v_top_indices
@@ -534,35 +685,13 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         y_pred_proba = model.predict_proba(X_combined)[:, 1]
         df_combined["pred_prob"] = y_pred_proba
         
-        # === 儲存訓練資料參考樣貌供 drift 檢查 ===
-        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # ref_dir = os.path.join("D:/備註文字探勘/models", f"{timestamp}/strategy_{strategy_id}/")
-        # os.makedirs(ref_dir, exist_ok=True)
-        # df_train[numerical_cols].to_csv(os.path.join(ref_dir, "train_reference.csv"), index=False)
-        # print(f"✅ strategy {strategy_id} 的 train_reference 已匯出至 {ref_dir}")
-
-        
-        # ref_dir = os.path.join("D:/備註文字探勘/models", timestamp)
-        # os.makedirs(ref_dir, exist_ok=True)
-        
-        # # selected_cols = [
-        # #     '備註字數', '件數', '總保費', '拜訪目的', '業務客戶年齡差距',
-        # #     '上半年準客戶數', '今年度活動參與率', '上年度FYC'
-        # # ]
-        
-        # df_train[numerical_cols].to_csv(os.path.join(ref_dir, "train_reference.csv"), index=False)
-        # print(f"✅ train_reference 已匯出")
-
-        # 建立 strategy-specific 子資料夾
-        # strategy_dir = os.path.join(save_dir, f"strategy_{strategy_id}")
-        # os.makedirs(strategy_dir, exist_ok=True)
-        
+        # === 儲存訓練資料參考樣貌供 drift 檢查 ===    
         # --- 存模型到 models/<timestamp>/strategy_{sid}/ ---
         strategy_dir=os.path.join(models_dir, f"strategy_{strategy_id}")
         os.makedirs(strategy_dir, exist_ok=True)
         joblib.dump(model,              os.path.join(strategy_dir,"model_final.pkl"))
         # 若你有 w2v / tfidf 物件可一起 dump；這裡假設以「平均後向量」為主不需再存
-        joblib.dump(scaler,             os.path.join(strategy_dir,"scaler.pkl"))
+        # joblib.dump(scaler,             os.path.join(strategy_dir,"scaler.pkl"))
         joblib.dump(w2v_model,    os.path.join(strategy_dir,"word2vec_model.pkl"))
         # 存 feature_names（含 w2v_前綴 + 數值 +（可選）tag 名稱）
         feat_names=[f"w2v_{i}" for i in w2v_top_indices]+numerical_cols
@@ -573,12 +702,6 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
 
         
         
-        # # 儲存模型與處理器
-        # joblib.dump(model, os.path.join(strategy_dir, f"model_final.pkl"))
-        # joblib.dump(w2v_model, os.path.join(strategy_dir, f"word2vec_model.pkl"))
-        # joblib.dump(tfidf_vectorizer, os.path.join(strategy_dir, f"tfidf_vectorizer.pkl"))
-        # joblib.dump(scaler, os.path.join(strategy_dir, f"scaler.pkl"))
-        # joblib.dump(final_feature_names, os.path.join(strategy_dir, f"feature_names.pkl"))
         
         # Step 8: 更新 latest.json（寫在 save_dir 下，記錄所有策略的最新位置）
         latest_info = {
@@ -605,55 +728,6 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
     
         print(f"✅ latest.json 已更新：{models_root} 與 {models_dir}")
         
-        # for strategy_id in [0, 2, 6]:
-        #     strategy_dir = os.path.join(save_dir, f"strategy_{strategy_id}")
-        #     latest_info["strategies"][str(strategy_id)] = {
-        #         "model": os.path.join(strategy_dir, "model_final.pkl"),
-        #         "word2vec": os.path.join(strategy_dir, "word2vec_model.pkl"),
-        #         "tfidf": os.path.join(strategy_dir, "tfidf_vectorizer.pkl"),
-        #         "scaler": os.path.join(strategy_dir, "scaler.pkl"),
-        #         "features": os.path.join(strategy_dir, "feature_names.pkl"),
-        #         "train_reference": os.path.join(strategy_dir, "train_reference.csv")
-        #     }
-        
-        # with open(os.path.join(save_dir, "latest.json"), "w", encoding="utf-8") as f:
-        #     json.dump(latest_info, f, ensure_ascii=False, indent=2)
-        
-        # print(f"✅ 所有策略的最新模型資訊已儲存至 {os.path.join(save_dir, 'latest.json')}")
-            
-        # # Step 7: 儲存模型與相關物件
-        # timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # joblib.dump(model, os.path.join(save_dir, f"model_final_{timestamp}.pkl"))
-        # joblib.dump(w2v_model, os.path.join(save_dir, f"word2vec_model_{timestamp}.pkl"))
-        # joblib.dump(tfidf_vectorizer, os.path.join(save_dir, f"tfidf_vectorizer_{timestamp}.pkl"))
-        # joblib.dump(scaler, os.path.join(save_dir, f"scaler_{timestamp}.pkl"))
-        # joblib.dump(final_feature_names, os.path.join(save_dir, f"feature_names_{timestamp}.pkl"))
-    
-        # # Step 8: 更新 latest.json
-        # latest_info = {
-        #     "timestamp": timestamp,
-        #     "model": f"model_final_{timestamp}.pkl",
-        #     "word2vec": f"word2vec_model_{timestamp}.pkl",
-        #     "tfidf": f"tfidf_vectorizer_{timestamp}.pkl",
-        #     "scaler": f"scaler_{timestamp}.pkl",
-        #     "features": f"feature_names_{timestamp}.pkl"
-        # }
-        # with open(os.path.join(save_dir, "latest.json"), "w", encoding="utf-8") as f:
-        #     json.dump(latest_info, f, ensure_ascii=False, indent=2)
-        # print(f"✅ 最新模型檔案資訊已儲存至 latest.json")
-    
-        # # Step 9: 匯出 train_reference.csv（供資料漂移檢查使用）
-        # df_ready.to_csv(os.path.join(save_dir, f"train_reference_{timestamp}.csv"), index=False)
-        # df_ready.to_csv(os.path.join(save_dir, "train_reference.csv"), index=False)
-        
-        # # --- 8. 簡易監控統計 ---
-        # train_pos = df_combined[df_combined["is_holdout"] == 0]["label"].sum()
-        # train_total = (df_combined["is_holdout"] == 0).sum()
-        # holdout_pos = df_combined[df_combined["is_holdout"] == 1]["label"].sum()
-        # holdout_total = (df_combined["is_holdout"] == 1).sum()
-    
-        # print(f"Train 資料: {train_total} 筆，正類佔比: {train_pos / train_total:.2%}")
-        # print(f"Holdout 資料: {holdout_total} 筆，正類佔比: {holdout_pos / holdout_total:.2%}")
 
         # === 匯出 WordCloud 長格式 ===
         wordcloud_records = []
@@ -670,14 +744,16 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
     
         # === SHAP 分析（僅策略 0, 2, 6）===
         debug_mode = False  # 若要看 SHAP 失敗原因，改為 True
-        
+        summary_df = pd.DataFrame(columns=["變數","原始值區間_起","原始值區間_迄"]) 
         if strategy_id in [0, 2, 6]:
             try:
-                explainer = shap.Explainer(model, X_train_full, feature_names=[f"W2V_{i}" for i in range(top_k)] + numerical_cols + list(mlb.classes_) if tag_cols else [])
+                explainer = shap.TreeExplainer(model, feature_names=final_feature_names)
                 shap_values = explainer(X_train_full)
+                # explainer = shap.Explainer(model, X_train_full, feature_names=[f"W2V_{i}" for i in range(top_k)] + numerical_cols + list(mlb.classes_) if tag_cols else [])
+                # shap_values = explainer(X_train_full)
     
-                mean_dict = dict(zip(numerical_cols, scaler.mean_))
-                scale_dict = dict(zip(numerical_cols, scaler.scale_))
+                # mean_dict = dict(zip(numerical_cols, scaler.mean_))
+                # scale_dict = dict(zip(numerical_cols, scaler.scale_))
                 
                 output_dir = os.path.join(results_dir, f"shap_plots_strategy_{strategy_id}")
                 os.makedirs(output_dir, exist_ok=True)
@@ -685,8 +761,8 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
                 summary_df = plot_shap_bin_auto_with_summary_dual_x(
                     X_train_full, shap_values, final_feature_names,
                     variables=numerical_cols,  # 可調整是否包含 tag
-                    mean_dict=dict(zip(numerical_cols, scaler.mean_)),
-                    scale_dict=dict(zip(numerical_cols, scaler.scale_)),
+                    mean_dict = dict(zip(numerical_cols, means)), 
+                    scale_dict = dict(zip(numerical_cols, stds)), 
                     output_dir=output_dir,
                     window=20, min_range_width=0.1, merge_gap=0.05
                 )
@@ -701,7 +777,6 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
                 )
                 
                 all_summary_dfs.append(summary_df)
-        
                 print(f"✅ SHAP 圖片與區間已儲存：strategy {strategy_id}")
         
             except Exception as e:
@@ -710,106 +785,34 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
                     
         # === 依 SHAP 正向區間，為每筆資料標註「正向」欄位 ===
         df_combined = add_shap_positive_hits(df_combined, summary_df, numerical_cols)
-                    
-
-
-        # # 結尾處（例如所有策略跑完之後）
-        # if all_summary_dfs:
-        #     summary_all = pd.concat(all_summary_dfs, ignore_index=True)
-        #     summary_all.to_excel(os.path.join(results_dir, "shap_summary_all.xlsx"), index=False)
-        #     print("✅ SHAP summary_all.xlsx 已儲存")
-                # for i, var in enumerate(numerical_cols):
-                #     x = X_train_full[:, top_k + i]
-                #     shap_val = shap_values[:, top_k + i].values
-                #     df = pd.DataFrame({"值": x, "SHAP": shap_val}).sort_values("值").reset_index(drop=True)
-                #     df["SHAP_smooth"] = df["SHAP"].rolling(window=20, min_periods=1).mean()
-                #     df["is_neg"] = (df["SHAP_smooth"] < 0).astype(int)
-                #     df["neg_group"] = (df["is_neg"].diff(1) != 0).cumsum()
-                #     neg_ranges = df[df["is_neg"] == 1].groupby("neg_group")["值"].agg(["min", "max"]).values
-                #     value_min, value_max = df["值"].min(), df["值"].max()
-                #     positive_ranges = []
-                #     current_start = value_min
-                #     for lo, hi in neg_ranges:
-                #         if current_start < lo:
-                #             positive_ranges.append((current_start, lo))
-                #         current_start = max(current_start, hi)
-                #     if current_start < value_max:
-                #         positive_ranges.append((current_start, value_max))
-                #     for lo, hi in positive_ranges:
-                #         lo_raw = lo * scale_dict[var] + mean_dict[var]
-                #         hi_raw = hi * scale_dict[var] + mean_dict[var]
-                #         summary_list.append({
-                #             "timestamp": timestamp, 
-                #             "strategy_id": strategy_id,
-                #             "變數": var,
-                #             "原始值區間_起": round(lo_raw, 2),
-                #             "原始值區間_迄": round(hi_raw, 2),
-                #             "標準化值_起": round(lo, 2),
-                #             "標準化值_迄": round(hi, 2)
-                #         })
-                    # # 區間合併邏輯
-                    # merged_ranges = []
-                    # for lo, hi in sorted(pos_ranges, key=lambda x: x[0]):
-                    #     if not merged_ranges:
-                    #         merged_ranges.append([lo, hi])
-                    #     else:
-                    #         last_lo, last_hi = merged_ranges[-1]
-                    #         if lo <= last_hi:  # 有重疊
-                    #             merged_ranges[-1][1] = max(last_hi, hi)  # 合併
-                    #         else:
-                    #             merged_ranges.append([lo, hi])
-                    
-                    # # 用合併後的區間寫入 summary_list
-                    # for lo, hi in merged_ranges:
-                    #     lo_raw = lo * scale_dict[var] + mean_dict[var]
-                    #     hi_raw = hi * scale_dict[var] + mean_dict[var]
-                    #     summary_list.append({
-                    #         "timestamp": timestamp,
-                    #         "strategy_id": strategy_id,
-                    #         "變數": var,
-                    #         "原始值區間_起": round(lo_raw, 2),
-                    #         "原始值區間_迄": round(hi_raw, 2),
-                    #         "標準化值_起": round(lo, 2),
-                    #         "標準化值_迄": round(hi, 2)
-                    #     })
-                    
-            # except Exception as e:
-            #     if debug_mode:
-            #         print(f"❌ SHAP 分析失敗(strategy {strategy_id})：{e}")
-
-        # # === 儲存成 Excel 檔 ===
-        # output_path = os.path.join(save_dir, f"model_strategy_{strategy_id}_{timestamp}.xlsx")
-        # with ExcelWriter(output_path, engine='xlsxwriter') as writer:
-        #     df_combined.to_excel(writer, index=False, sheet_name="ModelResults")
-        #     wordcloud_df.to_excel(writer, index=False, sheet_name="WordCloud")
-        #     if summary_list:
-        #         pd.DataFrame(summary_list).to_excel(writer, sheet_name="SHAP貢獻區間", index=False)
-        # print(f"✅ 模型 {strategy_id} 資料儲存至：{output_path}")
-    
-        # # === 寫入監控資訊 ===
-        # df_train_ = df_combined[df_combined["is_holdout"] == 0]
-        # df_holdout_ = df_combined[df_combined["is_holdout"] == 1]
-        # monitoring_row = {
-        #     "timestamp": timestamp,
-        #     "strategy_id": strategy_id,
-        #     "model_file": f"model_strategy_{strategy_id}_{timestamp}.pkl",
-        #     "train_size": len(df_train_),
-        #     "train_pos_ratio": round(df_train_["label"].mean(), 4),
-        #     "test_size": len(df_holdout_),
-        #     "test_pos_ratio": round(df_holdout_["label"].mean(), 4),
-        #     "cv_roc_auc": np.mean(roc_scores),
-        #     "cv_pr_auc": np.mean(pr_scores),
-        #     "test_roc_auc": roc_auc_score(df_holdout_["label"], df_holdout_["pred_prob"]),
-        #     "test_pr_auc": average_precision_score(df_holdout_["label"], df_holdout_["pred_prob"])
-        # }
-        # all_monitoring_rows.append(monitoring_row)
         
+        # 3. 一次性新增 timestamp & strategy_id（避免多次 insert）
+        df_combined = df_combined.assign(
+            timestamp=timestamp,
+            strategy_id=strategy_id
+        ).copy() 
+                    
+
+        # === strategy 迴圈內，原本計算完 df_combined 後加這段 ===
+        # heatmap_long = build_heatmap_long(df_combined, numerical_cols)
+        
+        heatmap_long = build_heatmap_long(
+            df_combined=df_combined,
+            variables=numerical_cols,          # 你要畫熱力圖的變數清單
+            id_cols=["timestamp","strategy_id","客戶UUID","拜訪紀錄UUID","is_holdout","label","pred_prob"]
+        )
+        print(f"[debug] strategy={strategy_id} heatmap_long.shape={heatmap_long.shape}")
+        print("[debug] build_heatmap_long dtypes:", heatmap_long.dtypes.to_dict())
+
+        # 收集起來
+        all_heatmap_longs.append(heatmap_long)
+        print(f"[debug] collected so far: {[df['strategy_id'].iloc[0] if not df.empty and 'strategy_id' in df.columns else 'EMPTY' for df in all_heatmap_longs]}")
         
         # === 單一 strategy 檔案（留存原始）+ 彙整檔（累積所有 strategy） ===
-        # 先加上識別欄位
-        df_combined = df_combined.copy()
-        df_combined["timestamp"] = timestamp
-        df_combined["strategy_id"] = strategy_id
+        # # 先加上識別欄位
+        # df_combined = df_combined.copy()
+        # df_combined["timestamp"] = timestamp
+        # df_combined["strategy_id"] = strategy_id
     
         wordcloud_df = wordcloud_df.copy()
         wordcloud_df["timestamp"] = timestamp
@@ -866,32 +869,6 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         all_monitoring_rows.append(monitoring_row)
         
         
-        # # --- 監控合併寫到 results/<timestamp>/model_monitoring.xlsx ---
-        # mon_path=os.path.join(results_dir,"model_monitoring.xlsx")
-        # # shap_df = pd.DataFrame(summary_list)
-        # # monitoring_df = pd.DataFrame([monitoring_row])
-       
-        # with ExcelWriter(mon_path, engine="openpyxl") as w:
-        #     pd.DataFrame([monitoring_row]).to_excel(w, sheet_name="summary_log", index=False)
-        #     if not summary_df.empty: 
-        #         summary_df.to_excel(w, sheet_name="shap_ranges_log", index=False)
-        # print(f"📈 監控檔輸出：{mon_path}")
-    
-        # monitoring_xlsx_path = os.path.join("D:/備註文字探勘/results", "model_monitoring.xlsx")
-        # shap_df = pd.DataFrame(summary_list)
-        # monitoring_df = pd.DataFrame([monitoring_row])
-        # if os.path.exists(monitoring_xlsx_path):
-        #     with ExcelWriter(monitoring_xlsx_path, engine='openpyxl', mode='a', if_sheet_exists='overlay') as writer:
-        #         pd.concat([pd.read_excel(monitoring_xlsx_path, sheet_name="summary_log"), monitoring_df]).to_excel(writer, sheet_name="summary_log", index=False)
-        #         if not shap_df.empty:
-        #             pd.concat([pd.read_excel(monitoring_xlsx_path, sheet_name="shap_ranges_log"), shap_df]).to_excel(writer, sheet_name="shap_ranges_log", index=False)
-        # else:
-        #     with ExcelWriter(monitoring_xlsx_path, engine="openpyxl") as writer:
-        #         monitoring_df.to_excel(writer, sheet_name="summary_log", index=False)
-        #         if not shap_df.empty:
-        #             shap_df.to_excel(writer, sheet_name="shap_ranges_log", index=False)
-    
-        # print("📊 模型訓練與 SHAP 分析完成")
     # ====== 迴圈結束後：一次寫入歷史檔 ======
     # 1) 先把本次訓練的資料組起來
     new_monitoring_df = pd.DataFrame(all_monitoring_rows)
@@ -929,6 +906,15 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
             shap_out.to_excel(writer, sheet_name="shap_ranges_log", index=False)
     
     print(f"📈 歷史監控檔已更新：{history_path}")
+    
+    # === strategy 迴圈結束後，統一合併與輸出 ===
+    if all_heatmap_longs:
+        merged_heatmap_long = pd.concat(all_heatmap_longs, ignore_index=True)
+        heatmap_out_path = os.path.join(results_dir, "heatmap_long_all_strategies.csv")
+        merged_heatmap_long.to_csv(heatmap_out_path, index=False, encoding="utf-8-sig")
+        print(f"✅ heatmap_long 輸出完成：{heatmap_out_path}")
+    else:
+        print("⚠️ 沒有任何 heatmap_long 資料可輸出")
     
     return df_combined, model
         

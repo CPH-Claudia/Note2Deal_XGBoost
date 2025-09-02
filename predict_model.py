@@ -5,11 +5,12 @@ Created on Fri Jun  6 09:34:53 2025
 @author: Z01788
 """
 
-import os, json, joblib
+import os, json, joblib, re
 import numpy as np
 import pandas as pd
 from gensim.models import Word2Vec
 from sklearn.metrics import classification_report, confusion_matrix, roc_auc_score, average_precision_score
+from openpyxl import load_workbook
 
 # ---------- 共用小工具 ----------
 def _get_latest_models_dir(models_root):
@@ -60,29 +61,38 @@ def load_models(models_root="D:/備註文字探勘/models", strategy_id=0):
     print(f"✅ 載入模型完成：{os.path.basename(base)}（strategy {strategy_id}）")
     return model, w2v, tfidf, scaler, feats, w2v_idx
 
-# def _find_latest_run_dir(base_dir="D:/備註文字探勘/results"):
-#     if not os.path.isdir(base_dir):
-#         return None
-#     # 抓像 20250808_101500 這種時間字串的資料夾
-#     candidates = [d for d in os.listdir(base_dir)
-#                   if os.path.isdir(os.path.join(base_dir, d)) and d[:8].isdigit()]
-#     if not candidates:
-#         return None
-#     candidates.sort(reverse=True)  # 新的在前
-#     return os.path.join(base_dir, candidates[0])
 
-def _merge_tags_row(row, cols=("個人化標籤_背景","個人化標籤_銷售","拜訪備註_標籤")):
+
+# def _merge_tags_row(row, cols=("個人化標籤_背景","個人化標籤_銷售","拜訪備註_標籤")):
+#     all_tags = []
+#     for c in cols:
+#         if c in row and pd.notna(row[c]):
+#             parts = (str(row[c])
+#                      .replace("，", ",")
+#                      .replace("、", ",")
+#                      .replace("  ", " ")
+#                      .replace(" ,", ",")
+#                      .split(","))
+#             for tag in parts:
+#                 t = tag.strip().strip(".").strip("🖊️").lower()
+#                 if t:
+#                     all_tags.append(t)
+#     return list(set(all_tags))
+def _merge_tags_row(row, cols=("個人化標籤_背景", "個人化標籤_銷售", "拜訪備註_標籤")):
     all_tags = []
+    emoji_pattern = re.compile("["
+        u"\U0001F600-\U0001F64F"  # 表情
+        u"\U0001F300-\U0001F5FF"  # 符號&圖形
+        u"\U0001F680-\U0001F6FF"  # 交通工具
+        u"\U0001F1E0-\U0001F1FF"  # 國旗
+        "]+", flags=re.UNICODE)
+
     for c in cols:
         if c in row and pd.notna(row[c]):
-            parts = (str(row[c])
-                     .replace("，", ",")
-                     .replace("、", ",")
-                     .replace("  ", " ")
-                     .replace(" ,", ",")
-                     .split(","))
+            clean = emoji_pattern.sub("", str(row[c]))
+            parts = clean.replace("，", ",").replace("、", ",").replace("  ", " ").replace(" ,", ",").split(",")
             for tag in parts:
-                t = tag.strip().strip(".").strip("🖊️").lower()
+                t = tag.strip().strip(".").lower()
                 if t:
                     all_tags.append(t)
     return list(set(all_tags))
@@ -149,143 +159,251 @@ def classify_probability(p):
     elif p >= 0.25: return "低潛力"
     else: return "極低潛力"
     
-def check_success_within_30_days(row, policy_df):
-    uuid = row['客戶UUID']
-    visit_date = row['拜訪時間 年/月/日']
-    
-    policies = policy_df[policy_df['經紀人1-被保人CRM UUID'] == uuid]
-    if policies.empty:
-        return 0
-    
-    matched = policies[
-        (policies['投保日 年/月/日'] > visit_date) &
-        (policies['投保日 年/月/日'] <= visit_date + pd.Timedelta(days=30))
-    ]
-    return 1 if not matched.empty else 0
+def predict_with_strategy(df_ready, strategy_id, models_root):
+    model, w2v_model, tfidf, scaler, features, top_idx = load_models(models_root, strategy_id)
 
-def evaluate_predictions(results_path, policy_df, threshold=0.6):
-    results_df = pd.read_excel(results_path)
-    results_df['拜訪時間 年/月/日'] = pd.to_datetime(results_df['拜訪時間 年/月/日'], errors='coerce')
-    policy_df['投保日 年/月/日'] = pd.to_datetime(policy_df['投保日 年/月/日'], errors='coerce')
-    results_df['實際是否成交'] = results_df.apply(lambda row: check_success_within_30_days(row, policy_df), axis=1)
-    results_df['預測是否成交'] = (results_df['預測成交機率'] >= threshold).astype(int)
+    w2v_feats = [f for f in features if f.upper().startswith("W2V_")]
+    top_k = len(w2v_feats)
+    num_feats = [f for f in features if f not in w2v_feats and f in df_ready.columns]
+    tag_feats = [f for f in features if f not in w2v_feats + num_feats]
 
-    cm = confusion_matrix(results_df['實際是否成交'], results_df['預測是否成交'])
-    report = classification_report(results_df['實際是否成交'], results_df['預測是否成交'], output_dict=True)
+    # 數值
+    X_num = df_ready[num_feats].fillna(0) if num_feats else pd.DataFrame(index=df_ready.index)
+    X_scaled = scaler.transform(X_num) if not X_num.empty else np.zeros((len(df_ready), 0))
 
-    with pd.ExcelWriter(results_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
-        results_df.to_excel(writer, sheet_name='預測結果_已驗證', index=False)
-        cm_df = pd.DataFrame(cm, index=["實際:未成交", "實際:成交"], columns=["預測:未成交", "預測:成交"])
-        cr_df = pd.DataFrame(report).T
-        cm_df.to_excel(writer, sheet_name='模型評估', startrow=0)
-        cr_df.to_excel(writer, sheet_name='模型評估', startrow=len(cm_df) + 3)
-    print(f"✅ 評估完成，結果已寫入：{results_path}") 
-
-
-# ---------- 預測主流程（改版） ----------
-def predict_with_model(df_ready, output_path, source_file=None, strategy_id=0, models_root="D:/備註文字探勘/models"):
-    # 1) 讀模型與處理器（最新一批 & 指定 strategy）
-    model, w2v_model, tfidf_vectorizer, scaler, features, w2v_top_indices = load_models(models_root, strategy_id)
-
-    # 2) 依 features 拆出 W2V / 數值 / 標籤類
-    feat_upper = [f.upper() for f in features]
-    w2v_feats   = [f for f in features if f.upper().startswith("W2V_")]
-    top_k       = len(w2v_feats)
-
-    # 數值欄位：以「features 中、且也出現在 df_ready.columns」者為準
-    numerical_cols = [f for f in features if (f not in w2v_feats) and (f in df_ready.columns)]
-
-    # 剩下的就視為 tag 類（有些策略沒有標籤，這裡就會是空 list）
-    tag_classes = [f for f in features if (f not in w2v_feats) and (f not in numerical_cols)]
-
-    # 3) 數值特徵
-    X_num = df_ready[numerical_cols].copy() if numerical_cols else pd.DataFrame(index=df_ready.index)
-    if not X_num.empty:
-        X_num = X_num.fillna(0)
-        X_scaled = scaler.transform(X_num)
-    else:
-        X_scaled = np.zeros((len(df_ready), 0))
-
-    # 4) 文字向量（加權平均）；注意要逐列處理，避免掉對齊
-    tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
-
-    def vectorize_sentence_weighted(tokens):
+    # 文字向量
+    tfidf_dict = dict(zip(tfidf.get_feature_names_out(), tfidf.idf_))
+    def get_vec(tokens):
         vecs, weights = [], []
         for word in tokens:
-            if (word in w2v_model.wv) and (word in tfidf_dict):
+            if word in w2v_model.wv and word in tfidf_dict:
                 vecs.append(w2v_model.wv[word] * tfidf_dict[word])
                 weights.append(tfidf_dict[word])
-        if vecs:
-            return np.sum(vecs, axis=0) / np.sum(weights)
-        return np.zeros(w2v_model.vector_size)
+        return np.sum(vecs, axis=0) / np.sum(weights) if vecs else np.zeros(w2v_model.vector_size)
 
-    tokens_series = df_ready['備註文字_處理'].fillna("").astype(str).apply(lambda x: x.split())
-    w2v_all = np.vstack([vectorize_sentence_weighted(toks) for toks in tokens_series])
+    w2v_all = np.vstack([get_vec(str(x).split()) for x in df_ready['備註文字_處理']])
+    X_w2v = w2v_all[:, top_idx] if top_idx is not None else w2v_all[:, :top_k]
 
-    # 5) 只取訓練時選過的前 top_k 維（有存 indices 則用，沒有就退而求其次用 range(top_k)）
-    if w2v_top_indices is not None:
-        X_w2v_top = w2v_all[:, w2v_top_indices]
-    else:
-        X_w2v_top = w2v_all[:, :top_k] if top_k > 0 else np.zeros((len(df_ready), 0))
-
-    # 6) 標籤類特徵（如果 features 有列出）
-    if tag_classes:
-        # 產出 merged_tags
+    # 標籤類
+    if tag_feats:
         merged = df_ready.apply(_merge_tags_row, axis=1)
-        # 對應成 multi-hot，tag_classes 的名稱就是 one-hot 欄位名
-        tag_index = {t: i for i, t in enumerate(tag_classes)}
-        X_tags = np.zeros((len(df_ready), len(tag_classes)), dtype=np.float32)
+        tag_idx = {t: i for i, t in enumerate(tag_feats)}
+        X_tags = np.zeros((len(df_ready), len(tag_feats)))
         for r, tags in enumerate(merged):
             for t in tags:
-                if t in tag_index:
-                    X_tags[r, tag_index[t]] = 1.0
+                if t in tag_idx:
+                    X_tags[r, tag_idx[t]] = 1.0
     else:
-        X_tags = np.zeros((len(df_ready), 0), dtype=np.float32)
+        X_tags = np.zeros((len(df_ready), 0))
 
-    # 7) 組合成最終特徵
-    X_final = np.hstack([X_w2v_top, X_scaled, X_tags])
+    X_final = np.hstack([X_w2v, X_scaled, X_tags])
+    y_prob = model.predict_proba(X_final)[:, 1]
+    y_pred = (y_prob >= 0.6).astype(int)
 
-    # 8) 推論
-    y_pred_proba = model.predict_proba(X_final)[:, 1]
-    y_pred = (y_pred_proba >= 0.6).astype(int)
+    df_out = df_ready.copy()
+    df_out["預測成交機率"] = y_prob
+    df_out["預測成交與否"] = y_pred
+    df_out["潛力分類"] = df_out["預測成交機率"].apply(classify_probability)
+    df_out["strategy_id"] = strategy_id
+    return df_out
 
-    out = df_ready.copy()
-    out['預測成交機率'] = y_pred_proba
-    out['預測成交與否'] = y_pred
-    out['潛力分類'] = out['預測成交機率'].apply(classify_probability)
-    
-    # === 建立斷詞長格式（包含預測機率）===
-    if '拜訪備註_詞語' in out.columns:
-        tokens_exploded = out[[
-            '客戶UUID', '拜訪紀錄UUID', '拜訪備註_詞語', '預測成交機率'
-        ]].explode('拜訪備註_詞語').rename(columns={'拜訪備註_詞語': '詞語'}).dropna(subset=['詞語'])
-    else:
-        tokens_exploded = pd.DataFrame()
-
-    # 9) 輸出 Excel（如有真實標籤就一起算評估）
-    def generate_model_report(y_true, y_pred, y_prob):
-        report_dict = classification_report(y_true, y_pred, output_dict=True)
-        report_df = pd.DataFrame(report_dict).T
-        report_df["ROC AUC"] = roc_auc_score(y_true, y_prob)
-        report_df["PR AUC"] = average_precision_score(y_true, y_prob)
-        return report_df
-
-    # 一次寫同一份 Excel（含三個 Sheet：預測結果 / 斷詞長格式 / 模型評估[如有]）
-    with pd.ExcelWriter(output_path, engine="openpyxl", mode="w") as writer:
-        out.to_excel(writer, index=False, sheet_name="預測結果")
-        tokens_exploded.to_excel(writer, index=False, sheet_name="斷詞長格式")
-
-        if 'label' in out.columns:
-            eval_df = generate_model_report(out['label'], out['預測成交與否'], out['預測成交機率'])
-            eval_df.to_excel(writer, sheet_name="模型評估")
-        # else: 沒有 label 就不寫「模型評估」sheet
-
-    print(f"✅ 預測完成，已儲存至：{output_path}")
-    
-    # 10) （可選）如果你還要用保單做 30 天成交比對，就用 evaluate_predictions
-    if source_file is not None:
+def predict_batch(df_ready, output_path, strategy_ids=[0, 5, 6], models_root="D:/備註文字探勘/models", policy_path=None):
+    all_results = []
+    for sid in strategy_ids:
         try:
-            policy_df = pd.read_excel(source_file, sheet_name="POLICY")
-            evaluate_predictions(results_path=output_path, policy_df=policy_df, threshold=0.6)
+            print(f"🚀 Predicting strategy {sid}")
+            result = predict_with_strategy(df_ready, sid, models_root)
+            result["strategy_id"] = sid
+            all_results.append(result)
         except Exception as e:
-            print(f"⚠️ 無法執行保單比對評估：{e}")
+            print(f"❌ Failed for strategy {sid}: {e}")
+
+    df_all = pd.concat(all_results, ignore_index=True)
+
+    # === optional: 比對實際成交（若給定保單資料）===
+    if policy_path is not None:
+        try:
+            policy_df = pd.read_excel(policy_path, sheet_name="POLICY")
+            policy_df['投保日 年/月/日'] = pd.to_datetime(policy_df['投保日 年/月/日'], errors='coerce')
+
+            def check_success(row):
+                uuid = row['客戶UUID']
+                visit_date = row['拜訪時間 年/月/日']
+                policies = policy_df[policy_df['經紀人1-被保人CRM UUID'] == uuid]
+                if policies.empty:
+                    return 0
+                matched = policies[
+                    (policies['投保日 年/月/日'] > visit_date) &
+                    (policies['投保日 年/月/日'] <= visit_date + pd.Timedelta(days=30))
+                ]
+                return 1 if not matched.empty else 0
+
+            df_all['實際是否成交'] = df_all.apply(check_success, axis=1)
+            df_all['預測是否成交'] = (df_all['預測成交機率'] >= 0.6).astype(int)
+        except Exception as e:
+            print(f"⚠️ 保單比對失敗：{e}")
+
+    # === 斷詞長格式 ===
+    tokens_long = df_all[['客戶UUID', '拜訪紀錄UUID', '備註文字_處理', '預測成交機率', 'strategy_id']].copy()
+    tokens_long['備註文字_詞語'] = tokens_long['備註文字_處理'].astype(str).str.split()
+    tokens_long = tokens_long.explode("備註文字_詞語").rename(columns={"備註文字_詞語": "詞語"}).dropna(subset=["詞語"])
+
+    # === 儲存輸出 ===
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        df_all.to_excel(writer, sheet_name="預測結果", index=False)
+        tokens_long.to_excel(writer, sheet_name="斷詞長格式", index=False)
+
+        if '實際是否成交' in df_all.columns:
+            cm = confusion_matrix(df_all['實際是否成交'], df_all['預測是否成交'])
+            report = classification_report(df_all['實際是否成交'], df_all['預測是否成交'], output_dict=True)
+
+            cm_df = pd.DataFrame(cm, index=["實際:未成交", "實際:成交"], columns=["預測:未成交", "預測:成交"])
+            cr_df = pd.DataFrame(report).T
+
+            cm_df.to_excel(writer, sheet_name='模型評估', startrow=0)
+            cr_df.to_excel(writer, sheet_name='模型評估', startrow=len(cm_df) + 3)
+
+    print(f"✅ All strategy predictions saved to {output_path}")
+            
+
+    
+# def check_success_within_30_days(row, policy_df):
+#     uuid = row['客戶UUID']
+#     visit_date = row['拜訪時間 年/月/日']
+    
+#     policies = policy_df[policy_df['經紀人1-被保人CRM UUID'] == uuid]
+#     if policies.empty:
+#         return 0
+    
+#     matched = policies[
+#         (policies['投保日 年/月/日'] > visit_date) &
+#         (policies['投保日 年/月/日'] <= visit_date + pd.Timedelta(days=30))
+#     ]
+#     return 1 if not matched.empty else 0
+
+# def evaluate_predictions(results_path, policy_df, threshold=0.6):
+#     results_df = pd.read_excel(results_path)
+#     results_df['拜訪時間 年/月/日'] = pd.to_datetime(results_df['拜訪時間 年/月/日'], errors='coerce')
+#     policy_df['投保日 年/月/日'] = pd.to_datetime(policy_df['投保日 年/月/日'], errors='coerce')
+#     results_df['實際是否成交'] = results_df.apply(lambda row: check_success_within_30_days(row, policy_df), axis=1)
+#     results_df['預測是否成交'] = (results_df['預測成交機率'] >= threshold).astype(int)
+
+#     cm = confusion_matrix(results_df['實際是否成交'], results_df['預測是否成交'])
+#     report = classification_report(results_df['實際是否成交'], results_df['預測是否成交'], output_dict=True)
+
+#     with pd.ExcelWriter(results_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
+#         results_df.to_excel(writer, sheet_name='預測結果_已驗證', index=False)
+#         cm_df = pd.DataFrame(cm, index=["實際:未成交", "實際:成交"], columns=["預測:未成交", "預測:成交"])
+#         cr_df = pd.DataFrame(report).T
+#         cm_df.to_excel(writer, sheet_name='模型評估', startrow=0)
+#         cr_df.to_excel(writer, sheet_name='模型評估', startrow=len(cm_df) + 3)
+#     print(f"✅ 評估完成，結果已寫入：{results_path}") 
+
+
+# # ---------- 預測主流程（改版） ----------
+# def predict_with_model(df_ready, output_path, source_file=None, strategy_id=0, models_root="D:/備註文字探勘/models"):
+#     # 1) 讀模型與處理器（最新一批 & 指定 strategy）
+#     model, w2v_model, tfidf_vectorizer, scaler, features, w2v_top_indices = load_models(models_root, strategy_id)
+
+#     # 2) 依 features 拆出 W2V / 數值 / 標籤類
+#     feat_upper = [f.upper() for f in features]
+#     w2v_feats   = [f for f in features if f.upper().startswith("W2V_")]
+#     top_k       = len(w2v_feats)
+
+#     # 數值欄位：以「features 中、且也出現在 df_ready.columns」者為準
+#     numerical_cols = [f for f in features if (f not in w2v_feats) and (f in df_ready.columns)]
+
+#     # 剩下的就視為 tag 類（有些策略沒有標籤，這裡就會是空 list）
+#     tag_classes = [f for f in features if (f not in w2v_feats) and (f not in numerical_cols)]
+
+#     # 3) 數值特徵
+#     X_num = df_ready[numerical_cols].copy() if numerical_cols else pd.DataFrame(index=df_ready.index)
+#     if not X_num.empty:
+#         X_num = X_num.fillna(0)
+#         X_scaled = scaler.transform(X_num)
+#     else:
+#         X_scaled = np.zeros((len(df_ready), 0))
+
+#     # 4) 文字向量（加權平均）；注意要逐列處理，避免掉對齊
+#     tfidf_dict = dict(zip(tfidf_vectorizer.get_feature_names_out(), tfidf_vectorizer.idf_))
+
+#     def vectorize_sentence_weighted(tokens):
+#         vecs, weights = [], []
+#         for word in tokens:
+#             if (word in w2v_model.wv) and (word in tfidf_dict):
+#                 vecs.append(w2v_model.wv[word] * tfidf_dict[word])
+#                 weights.append(tfidf_dict[word])
+#         if vecs:
+#             return np.sum(vecs, axis=0) / np.sum(weights)
+#         return np.zeros(w2v_model.vector_size)
+
+#     tokens_series = df_ready['備註文字_處理'].fillna("").astype(str).apply(lambda x: x.split())
+#     w2v_all = np.vstack([vectorize_sentence_weighted(toks) for toks in tokens_series])
+
+#     # 5) 只取訓練時選過的前 top_k 維（有存 indices 則用，沒有就退而求其次用 range(top_k)）
+#     if w2v_top_indices is not None:
+#         X_w2v_top = w2v_all[:, w2v_top_indices]
+#     else:
+#         X_w2v_top = w2v_all[:, :top_k] if top_k > 0 else np.zeros((len(df_ready), 0))
+
+#     # 6) 標籤類特徵（如果 features 有列出）
+#     if tag_classes:
+#         # 產出 merged_tags
+#         merged = df_ready.apply(_merge_tags_row, axis=1)
+#         # 對應成 multi-hot，tag_classes 的名稱就是 one-hot 欄位名
+#         tag_index = {t: i for i, t in enumerate(tag_classes)}
+#         X_tags = np.zeros((len(df_ready), len(tag_classes)), dtype=np.float32)
+#         for r, tags in enumerate(merged):
+#             for t in tags:
+#                 if t in tag_index:
+#                     X_tags[r, tag_index[t]] = 1.0
+#     else:
+#         X_tags = np.zeros((len(df_ready), 0), dtype=np.float32)
+
+#     # 7) 組合成最終特徵
+#     X_final = np.hstack([X_w2v_top, X_scaled, X_tags])
+
+#     # 8) 推論
+#     y_pred_proba = model.predict_proba(X_final)[:, 1]
+#     y_pred = (y_pred_proba >= 0.6).astype(int)
+
+#     out = df_ready.copy()
+#     out['預測成交機率'] = y_pred_proba
+#     out['預測成交與否'] = y_pred
+#     out['潛力分類'] = out['預測成交機率'].apply(classify_probability)
+    
+#     # === 建立斷詞長格式（包含預測機率）===
+#     if '拜訪備註_詞語' in out.columns:
+#         tokens_exploded = out[[
+#             '客戶UUID', '拜訪紀錄UUID', '拜訪備註_詞語', '預測成交機率'
+#         ]].explode('拜訪備註_詞語').rename(columns={'拜訪備註_詞語': '詞語'}).dropna(subset=['詞語'])
+#     else:
+#         tokens_exploded = pd.DataFrame()
+
+#     # 9) 輸出 Excel（如有真實標籤就一起算評估）
+#     def generate_model_report(y_true, y_pred, y_prob):
+#         report_dict = classification_report(y_true, y_pred, output_dict=True)
+#         report_df = pd.DataFrame(report_dict).T
+#         report_df["ROC AUC"] = roc_auc_score(y_true, y_prob)
+#         report_df["PR AUC"] = average_precision_score(y_true, y_prob)
+#         return report_df
+
+#     # 一次寫同一份 Excel（含三個 Sheet：預測結果 / 斷詞長格式 / 模型評估[如有]）
+#     with pd.ExcelWriter(output_path, engine="openpyxl", mode="w") as writer:
+#         out.to_excel(writer, index=False, sheet_name="預測結果")
+#         tokens_exploded.to_excel(writer, index=False, sheet_name="斷詞長格式")
+
+#         if 'label' in out.columns:
+#             eval_df = generate_model_report(out['label'], out['預測成交與否'], out['預測成交機率'])
+#             eval_df.to_excel(writer, sheet_name="模型評估")
+#         # else: 沒有 label 就不寫「模型評估」sheet
+
+#     print(f"✅ 預測完成，已儲存至：{output_path}")
+    
+#     # 10) （可選）如果你還要用保單做 30 天成交比對，就用 evaluate_predictions
+#     if source_file is not None:
+#         try:
+#             policy_df = pd.read_excel(source_file, sheet_name="POLICY")
+#             evaluate_predictions(results_path=output_path, policy_df=policy_df, threshold=0.6)
+#         except Exception as e:
+#             print(f"⚠️ 無法執行保單比對評估：{e}")

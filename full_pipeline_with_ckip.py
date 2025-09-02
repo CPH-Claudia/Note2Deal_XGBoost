@@ -186,22 +186,22 @@ def full_pipeline_with_ckip(file_path):
             return df_ready, policy_df  # retrain 中已處理預測與輸出，這裡直接結束流程
     
         # === 若無資料偏移，使用既有模型進行預測 ===
-        from predict_model import predict_with_model
+        from predict_model import predict_batch
         timestamp = datetime.now().strftime("%Y%m%d_%H%M")
         output_path = os.path.join(output_dir, f"results/預測_{timestamp}.xlsx")
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        predict_with_model(df_ready, output_path, source_file=file_path)
+        predict_batch(df_ready, output_path, strategy_ids=[0, 2, 6])
         
-        from predict_model import predict_with_model
+        # from predict_model import predict_with_model
         
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-        strategy_ids = [0, 2, 6]   # 想跑哪幾個就在這裡改
-        out_dir = os.path.join("D:/備註文字探勘/results", timestamp)
-        os.makedirs(out_dir, exist_ok=True)
-        output_path = os.path.join(out_dir, f"預測_{timestamp}.xlsx")
+        # timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+        # strategy_ids = [0, 2, 6]   # 想跑哪幾個就在這裡改
+        # out_dir = os.path.join("D:/備註文字探勘/results", timestamp)
+        # os.makedirs(out_dir, exist_ok=True)
+        # output_path = os.path.join(out_dir, f"預測_{timestamp}.xlsx")
         
-        for sid in strategy_ids:
-            predict_with_model(df_ready, output_path, strategy_id=sid, models_root="D:/備註文字探勘/models")
+        # for sid in strategy_ids:
+        #     predict_with_model(df_ready, output_path, strategy_id=sid, models_root="D:/備註文字探勘/models")
             # out_path = os.path.join(output_dir, f"results/預測_{timestamp}_{sid}.xlsx")
             # os.makedirs(os.path.dirname(out_path), exist_ok=True)
             # predict_with_model(df_ready, out_path, source_file=file_path, strategy_id=sid)

@@ -116,11 +116,21 @@ def check_drift_and_warn(
       True/False （是否允許繼續）
     """
     # 預設檢查欄位（建議傳入你實際用於模型的數值欄）
+    # if not selected_cols:
+    #     selected_cols = [
+    #         '備註字數', '件數', '總保費', '拜訪目的', '業務客戶年齡差距',
+    #         '上半年準客戶數', '最近半年活動參與率', '上一個半年度FYC'
+    #     ]
+    import joblib  # ← 檔案開頭要補這個 import（最小侵入）
+    
+    # 預設檢查欄位（嘗試由最新模型的 feature_names.pkl 派生）
     if not selected_cols:
-        selected_cols = [
-            '備註字數', '件數', '總保費', '拜訪目的', '業務客戶年齡差距',
-            '上半年準客戶數', '最近半年活動參與率', '上一個半年度FYC'
-        ]
+        _auto_cols = []
+        try:
+            # 先取得 refs（下面本函式本來就會算），因此把「selected_cols 推導」放在拿到 refs 之後
+            pass
+        except Exception:
+            pass
 
     # 取得參考資料來源
     refs = None
@@ -140,6 +150,29 @@ def check_drift_and_warn(
     else:
         print("⚠️ ref_source 型別不支援，略過資料漂移檢查（允許繼續）")
         return True
+    
+    # === 新增：selected_cols 自动推导（feature_names.pkl ∩ new_df 的數值欄，不含 W2V 維）===
+    if not selected_cols:
+        try:
+            any_sid, any_path = next(iter(refs.items()))
+            models_dir = os.path.dirname(os.path.dirname(any_path))  # .../models/<timestamp>/
+            feat_path = os.path.join(models_dir, f"strategy_{any_sid}", "feature_names.pkl")
+            feats = joblib.load(feat_path)
+            # 取 new_df 現有且是數值、且不是 W2V 維的欄
+            selected_cols = [
+                c for c in feats
+                if (c in new_df.columns and not str(c).upper().startswith("W2V_")
+                    and pd.api.types.is_numeric_dtype(new_df[c]))
+            ]
+            if not selected_cols:
+                raise ValueError("empty derived cols")
+            print(f"🧭 漂移檢查欄位（由 feature_names 推導）：{len(selected_cols)} 欄")
+        except Exception as e:
+            print(f"ℹ️ 無法由 feature_names 自動推導欄位（改用預設清單）：{e}")
+            selected_cols = [
+                '備註字數', '件數', '總保費', '拜訪目的', '業務客戶年齡差距',
+                '上半年準客戶數', '最近半年活動參與率', '上一個半年度FYC'
+            ]
 
     # 逐個策略做檢定
     overall_alert = False

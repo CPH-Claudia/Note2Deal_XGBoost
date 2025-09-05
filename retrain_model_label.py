@@ -585,14 +585,29 @@ def append_csv_fast(src_csv: str, dst_csv: str, header_written: bool) -> bool:
     return True  # 代表 header 已經存在
 
 
-
+    
 def plot_shap_bin_auto_with_summary_dual_x(
     X_data, shap_values, feature_names, variables,
     mean_dict, scale_dict,
     window=20, output_dir=None,
-    min_range_width=0.1, merge_gap=0.05
-):
+    min_range_width=0.1, merge_gap=0.05,
+    xgb_model=None,                             # ★ 新增：可選，若提供就輸出 XGB 重要性
+    xgb_importance_types=("gain","weight"),  # ★ 新增：XGB 重要性種類
+    xgb_topk=30                                # ★ 新增：重要性圖表取前幾名
+): 
     summary_list = []
+    
+    # === 新增：整體 SHAP Summary 圖（一次輸出全特徵的蜂群/小提琴圖）===
+    try:
+        if output_dir:
+            _shap_mat = getattr(shap_values, "values", shap_values)  # 兼容 Explanation / ndarray
+            plt.figure()
+            shap.summary_plot(_shap_mat, X_data, feature_names=feature_names, show=False)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, "shap_summary.png"), dpi=300, bbox_inches='tight')
+            plt.close()
+    except Exception as e:
+        print(f"⚠️ SHAP summary 繪圖失敗（略過）：{e}")
 
     for var in variables:
         try:
@@ -693,6 +708,33 @@ def plot_shap_bin_auto_with_summary_dual_x(
             
         except Exception as e:
             print(f"❌ {var} 失敗：{e}")
+            
+    # === 新增：XGBoost 特徵重要性輸出（依照訓練時的欄位順序 f0,f1,... 映射 feature_names）===
+    try:
+        if xgb_model is not None and output_dir:
+            booster = xgb_model.get_booster()
+            for imp_type in xgb_importance_types:
+                score = booster.get_score(importance_type=imp_type)  # {'f0': val, 'f1': val, ...}
+                rows = []
+                for idx, fname in enumerate(feature_names):
+                    val = float(score.get(f"f{idx}", 0.0))  # 沒出現的給 0
+                    rows.append((fname, val))
+                imp_df = pd.DataFrame(rows, columns=["feature", "importance"]).sort_values("importance", ascending=False)
+                # CSV
+                csv_path = os.path.join(output_dir, f"xgb_feature_importance_{imp_type}.csv")
+                imp_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+                # Top-K 長條圖
+                plt.figure(figsize=(8, max(3, xgb_topk*0.35)))
+                top = imp_df.head(xgb_topk)[::-1]
+                plt.barh(top["feature"], top["importance"])
+                plt.xlabel(f"XGBoost importance: {imp_type}")
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f"xgb_feature_importance_{imp_type}_top{xgb_topk}.png"),
+                            dpi=300, bbox_inches='tight')
+                plt.close()
+    except Exception as e:
+        print(f"⚠️ XGB 重要性輸出失敗（略過）：{e}")
+        
 
     return pd.DataFrame(summary_list)
 
@@ -766,6 +808,246 @@ def safe_append_csv(out_path: str, df: pd.DataFrame, force_schema: list = None):
     safe_write_csv(df, out_path, force_schema=force_schema, mode="a")
 
 
+def export_personal_ohe_artifacts(
+    df_combined: pd.DataFrame,
+    shap_values_combined,
+    final_feature_names: list,
+    mlb: "MultiLabelBinarizer",
+    results_dir: str,
+    strategy_id: int,
+    topn_bar: int = 31,
+    make_beeswarm: bool = True,
+    run_ts: str = None,
+):
+    """
+    個人化標籤（OHE）輸出：
+      1) personal_tags_shap_summary_strategy_{sid}.csv
+      2) personal_tags_importance_strategy_{sid}.csv   ← 新增（= 同 bar_df 內容）
+      3) bar / beeswarm 圖
+      4) personal_tags_contrib_strategy_{sid}.csv（逐列）
+    """
+    import numpy as np, pandas as pd, os, matplotlib.pyplot as plt, collections, random, csv
+
+    name2pos = {fn: i for i, fn in enumerate(final_feature_names)}
+    if (mlb is None) or (not hasattr(mlb, "classes_")):
+        print("ℹ️ 無個人化標籤（OHE）可輸出；mlb 為 None。")
+        return
+    personal_cols = [c for c in list(mlb.classes_) if c in name2pos]
+    if not personal_cols:
+        print("ℹ️ 個人化標籤 classes 不在特徵名中，略過。")
+        return
+
+    idxs = [name2pos[c] for c in personal_cols]
+    phi_p = shap_values_combined.values[:, idxs]  # (n_samples, n_tags)
+
+    # summary DataFrame（bar_df）
+    mean_abs_all    = np.abs(phi_p).mean(axis=0)
+    mean_signed_all = phi_p.mean(axis=0)
+
+    present_counter = collections.Counter()
+    if "personal_tags" in df_combined.columns:
+        for lst in df_combined["personal_tags"]:
+            for t in (lst or []): present_counter[t] += 1
+    counts = np.array([present_counter.get(tag, 0) for tag in personal_cols], dtype=int)
+    rate   = counts / max(1, len(df_combined))
+
+    present_only_meanabs = []
+    if "personal_tags" in df_combined.columns:
+        for j, tag in enumerate(personal_cols):
+            if counts[j] == 0:
+                present_only_meanabs.append(0.0)
+            else:
+                mask = df_combined["personal_tags"].apply(lambda lst: tag in (lst or []))
+                present_only_meanabs.append(float(np.abs(phi_p[mask.values, j]).mean()) if mask.any() else 0.0)
+    else:
+        present_only_meanabs = [0.0]*len(personal_cols)
+
+    bar_df = pd.DataFrame({
+        "tag": personal_cols,
+        "mean_abs_shap_all": mean_abs_all,
+        "mean_shap_signed_all": mean_signed_all,
+        "present_count": counts,
+        "present_rate": rate,
+        "mean_abs_shap_present": present_only_meanabs
+    }).sort_values("mean_abs_shap_all", ascending=False).reset_index(drop=True)
+
+    # 1) summary CSV（原檔名）
+    csv_summary = os.path.join(results_dir, f"personal_tags_shap_summary_strategy_{strategy_id}.csv")
+    bar_df.to_csv(csv_summary, index=False, encoding="utf-8-sig")
+    print(f"✅ 個人化標籤 summary：{csv_summary}")
+
+
+    # 3) 圖表
+    sub = bar_df.head(min(topn_bar, len(bar_df)))[::-1]
+    if len(sub) > 0:
+        plt.figure(figsize=(8, 0.35*max(6, len(sub))))
+        plt.barh(sub["tag"], sub["mean_abs_shap_all"])
+        plt.xlabel("Mean |SHAP| (log-odds)")
+        plt.title(f"Personal tags importance (Top {len(sub)})")
+        plt.tight_layout()
+        out_png = os.path.join(results_dir, f"personal_tags_shap_bar_top{len(sub)}_strategy_{strategy_id}.png")
+        plt.savefig(out_png, dpi=160); plt.close()
+        print(f"🖼️ 個人化標籤 bar 圖：{out_png}")
+
+    if make_beeswarm and len(sub) > 0:
+        toklist = sub["tag"].tolist()
+        xs, ys = [], []
+        for yi, tag in enumerate(toklist):
+            j = personal_cols.index(tag)
+            vals = phi_p[:, j]
+            m = min(len(vals), 2000)
+            if len(vals) > m:
+                idx_sample = np.random.choice(len(vals), size=m, replace=False)
+                vals = vals[idx_sample]
+            xs.extend(vals.tolist())
+            ys.extend([yi + (random.random()-0.5)*0.6 for _ in range(len(vals))])
+        plt.figure(figsize=(8, 0.6*max(6, len(toklist))))
+        plt.scatter(xs, ys, s=6, alpha=0.6)
+        plt.yticks(range(len(toklist)), toklist)
+        plt.xlabel("SHAP value (log-odds)")
+        plt.title(f"Personal tags beeswarm (Top {len(toklist)})")
+        plt.tight_layout()
+        out_png2 = os.path.join(results_dir, f"personal_tags_shap_beeswarm_top{len(toklist)}_strategy_{strategy_id}.png")
+        plt.savefig(out_png2, dpi=160); plt.close()
+        print(f"🖼️ 個人化標籤 beeswarm 圖：{out_png2}")
+
+    # 4) 逐列貢獻（含 approx_dp）
+    out_csv = os.path.join(results_dir, f"personal_tags_contrib_strategy_{strategy_id}.csv")
+    with open(out_csv, "w", encoding="utf-8-sig", newline="") as fw:
+        w = csv.writer(fw)
+        w.writerow(["timestamp","strategy_id","客戶UUID","拜訪紀錄UUID","tag",
+                    "shap_logodds","approx_dp","pred_prob","label"])
+        for r in range(phi_p.shape[0]):
+            p = df_combined.iloc[r].get("pred_prob", None)
+            ts_val = df_combined.iloc[r].get("timestamp", None)
+            if (ts_val is None) or (str(ts_val).strip() == "") or (str(ts_val).lower() == "nat"):
+                ts_val = run_ts
+            for tag, j in zip(personal_cols, idxs):
+                shap_val = float(shap_values_combined.values[r, j])
+                dp = (float(p)*(1.0-float(p))*shap_val) if (p is not None) else ""
+                w.writerow([
+                    ts_val,
+                    strategy_id,
+                    df_combined.iloc[r].get("客戶UUID", None),
+                    df_combined.iloc[r].get("拜訪紀錄UUID", None),
+                    tag,
+                    f"{shap_val:.8g}",
+                    f"{dp:.8g}" if dp != "" else "",
+                    p if p is not None else "",
+                    df_combined.iloc[r].get("label", "")
+                ])
+    print(f"📄 個人化標籤逐列貢獻：{out_csv}")
+
+
+def export_custom_tag_vector_artifacts(
+    df_combined: pd.DataFrame,
+    shap_values_combined,
+    final_feature_names: list,
+    w2v_model: "Word2Vec",
+    w2v_top_indices: list,
+    tfidf_dict: dict,
+    results_dir: str,
+    strategy_id: int,
+    write_global_rank: bool = True,
+    run_ts: str = None,
+):
+    """
+    自訂標籤（#標籤向量 w2vtag_*）輸出：
+      1) custom_tags_contrib_strategy_{sid}.csv（逐列 alignment 分配）
+      2) visit_custom_tags_token_importance_strategy_{sid}.csv（全域排行，原檔名）
+      3) custom_tags_importance_strategy_{sid}.csv       ← 新增（= 與 2 相同內容）
+    """
+    import numpy as np, pandas as pd, os, csv, collections
+
+    name2pos = {fn: i for i, fn in enumerate(final_feature_names)}
+    w2vtag_cols = [name2pos.get(f"w2vtag_{i}") for i in w2v_top_indices if f"w2vtag_{i}" in name2pos]
+    w2vtag_cols = [c for c in w2vtag_cols if c is not None]
+    if not w2vtag_cols:
+        print("ℹ️ 找不到 w2vtag_* 特徵，略過自訂標籤輸出。")
+        return
+
+    phi_tag = shap_values_combined.values[:, w2vtag_cols]  # (n, k)
+    top_idx = np.asarray(w2v_top_indices, dtype=int)
+    idf_lookup = tfidf_dict or {}
+
+    # 1) 逐列貢獻
+    out_csv = os.path.join(results_dir, f"custom_tags_contrib_strategy_{strategy_id}.csv")
+    with open(out_csv, "w", encoding="utf-8-sig", newline="") as fw:
+        w = csv.writer(fw)
+        w.writerow(["timestamp","strategy_id","客戶UUID","拜訪紀錄UUID","token",
+                    "token_contrib","token_contrib_pct","approx_dp","pred_prob","label"])
+        for r in range(df_combined.shape[0]):
+            tags = df_combined.iloc[r].get("visit_tag_list", [])
+            if not tags:
+                continue
+            toks = [t for t in tags if t in w2v_model.wv]
+            if not toks:
+                continue
+
+            ws = [idf_lookup.get(t, 0.0) for t in toks]
+            if not any(x > 0 for x in ws):
+                ws = [1.0]*len(toks)
+            denom = float(sum(ws))
+
+            contribs = []
+            for t, a in zip(toks, ws):
+                e = w2v_model.wv[t][top_idx]
+                s = (a/denom) * float(np.dot(e, phi_tag[r]))
+                contribs.append((t, s))
+            if not contribs:
+                continue
+
+            contribs.sort(key=lambda x: abs(x[1]), reverse=True)
+            abs_sum = sum(abs(s) for _, s in contribs) or 1.0
+            p = df_combined.iloc[r].get("pred_prob", None)
+            ts_val = df_combined.iloc[r].get("timestamp", None)
+            if (ts_val is None) or (str(ts_val).strip() == "") or (str(ts_val).lower() == "nat"):
+                ts_val = run_ts
+
+            for t, s in contribs:
+                pct = abs(s)/abs_sum
+                dp  = (float(p)*(1.0-float(p))*s) if (p is not None) else ""
+                w.writerow([
+                    ts_val,
+                    strategy_id,
+                    df_combined.iloc[r].get("客戶UUID", None),
+                    df_combined.iloc[r].get("拜訪紀錄UUID", None),
+                    t,
+                    f"{s:.8g}",
+                    f"{pct:.6f}",
+                    f"{dp:.8g}" if dp != "" else "",
+                    p if p is not None else "",
+                    df_combined.iloc[r].get("label", "")
+                ])
+    print(f"📄 自訂標籤逐列貢獻：{out_csv}")
+
+    # 2) 全域 token 重要度（讀剛寫的檔做彙總；也可直接在記憶體聚合）
+    if write_global_rank:
+        tag_aggr = collections.Counter()
+        cnt_aggr = collections.Counter()
+        with open(out_csv, "r", encoding="utf-8-sig") as fr:
+            next(fr)  # skip header
+            for line in fr:
+                parts = line.rstrip("\n").split(",")
+                if len(parts) >= 6:
+                    tok = parts[4]
+                    try:
+                        val = float(parts[5])
+                    except:
+                        val = 0.0
+                    tag_aggr[tok] += abs(val)
+                    cnt_aggr[tok] += 1
+
+        rank_rows = [{"token": k, "mean_abs_contrib": (tag_aggr[k]/max(1,cnt_aggr[k])), "count": cnt_aggr[k]}
+                     for k in tag_aggr]
+        rank_df = pd.DataFrame(rank_rows).sort_values("mean_abs_contrib", ascending=False)
+
+        # 原檔名
+        rank_csv_old = os.path.join(results_dir, f"visit_custom_tags_token_importance_strategy_{strategy_id}.csv")
+        rank_df.to_csv(rank_csv_old, index=False, encoding="utf-8-sig")
+        print(f"✅ 自訂標籤全域重要度（原名）：{rank_csv_old}")
+
+
 
 # main function
 def train_model_pipeline_with_strategies(df_ready, policy_df=None):
@@ -823,60 +1105,139 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         # 依 strategy_id 決定 tag 欄位與過濾條件
         # ==========================================
         
+        # # 依 strategy_id 決定要合併的欄位
+        # if strategy_id == 0:
+        #     tag_cols = []
+        # elif strategy_id == 1:
+        #     tag_cols = ['個人化標籤_背景', '個人化標籤_銷售']
+        # elif strategy_id == 2:
+        #     tag_cols = ['個人化標籤_背景', '個人化標籤_銷售']
+        # elif strategy_id == 3:
+        #     tag_cols = ['拜訪備註_標籤']
+        # elif strategy_id == 4:
+        #     tag_cols = ['拜訪備註_標籤']
+        # elif strategy_id == 5:
+        #     tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
+        # elif strategy_id == 6:
+        #     tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
+        # elif strategy_id == 7:
+        #     tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
+        # else:
+        #     tag_cols = []
         
-        # 依 strategy_id 決定要合併的欄位
-        if strategy_id == 0:
-            tag_cols = []
-        elif strategy_id == 1:
-            tag_cols = ['個人化標籤_背景', '個人化標籤_銷售']
-        elif strategy_id == 2:
-            tag_cols = ['個人化標籤_背景', '個人化標籤_銷售']
-        elif strategy_id == 3:
-            tag_cols = ['拜訪備註_標籤']
-        elif strategy_id == 4:
-            tag_cols = ['拜訪備註_標籤']
-        elif strategy_id == 5:
-            tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
-        elif strategy_id == 6:
-            tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
-        elif strategy_id == 7:
-            tag_cols = ['個人化標籤_背景', '個人化標籤_銷售', '拜訪備註_標籤']
-        else:
-            tag_cols = []
+        # # 標籤清理函式
+        # def split_tags(val):
+        #     if pd.isna(val):
+        #         return []
+        #     s = str(val).replace("，", ",").replace("、", ",").replace("  ", " ").replace(" ,", ",")
+        #     parts = [p.strip().strip(".").strip("🖊️").lower() for p in s.split(",")]
+        #     return [p for p in parts if p]
         
-        # 標籤清理函式
+        # # 合併標籤
+        # if tag_cols:
+        #     df_model["merged_tags"] = df_model.apply(
+        #         lambda r: sorted(set(sum([split_tags(r.get(c, None)) for c in tag_cols], []))),
+        #         axis=1
+        #     )
+        # else:
+        #     df_model["merged_tags"] = [[] for _ in range(len(df_model))]
+        
+        
+        
+        # 兩類資料來源：
+        # - 個人化標籤：固定集合 → OHE（MultiLabelBinarizer）
+        #   欄位：'個人化標籤_背景', '個人化標籤_銷售'
+        # - 自訂標籤（拜訪備註_標籤）：語彙 → W2V+TFIDF 加權平均（與備註文字一致）
+        
+        # 依 strategy_id 決定是否「納入特徵」
+        use_personal = strategy_id in {1, 2, 5, 6, 7}
+        use_visit    = strategy_id in {3, 4, 5, 6, 7}
+        
+        personal_cols = ['個人化標籤_背景', '個人化標籤_銷售']
+        visit_tag_col = '拜訪備註_標籤'
+        
         def split_tags(val):
-            if pd.isna(val):
+            """容忍 list/tuple 或 逗號分隔字串；去除 # 與雜字元；統一為小寫；回傳 list[str]。"""
+            if val is None or (isinstance(val, float) and pd.isna(val)):
                 return []
-            s = str(val).replace("，", ",").replace("、", ",").replace("  ", " ").replace(" ,", ",")
-            parts = [p.strip().strip(".").strip("🖊️").lower() for p in s.split(",")]
-            return [p for p in parts if p]
+            if isinstance(val, (list, tuple)):
+                s = ",".join(map(str, val))
+            else:
+                s = str(val)
+            s = (s.replace("，", ",").replace("、", ",")
+                   .replace("  ", " ").replace(" ,", ","))
+            toks = [p.strip().strip(".").strip("🖊️").strip("#").lower()
+                    for p in s.split(",")]
+            return [t for t in toks if t]
         
-        # 合併標籤
-        if tag_cols:
-            df_model["merged_tags"] = df_model.apply(
-                lambda r: sorted(set(sum([split_tags(r.get(c, None)) for c in tag_cols], []))),
+        # --- 個人化標籤：合併兩欄後 OHE 用 ---
+        if use_personal:
+            df_model["personal_tags"] = df_model.apply(
+                lambda r: sorted(set(sum([split_tags(r.get(c, None)) for c in personal_cols], []))),
                 axis=1
             )
         else:
-            df_model["merged_tags"] = [[] for _ in range(len(df_model))]
+            df_model["personal_tags"] = [[] for _ in range(len(df_model))]
         
-        # 篩選條件
-        if strategy_id in [2, 4, 6]:
-            # 需要任一欄位非空
-            df_model = df_model[df_model["merged_tags"].apply(lambda x: len(x) > 0)].reset_index(drop=True)
+        # --- 自訂標籤：向量化（W2V+TFIDF 加權平均；與備註文字一致）---
+        if use_visit and (visit_tag_col in df_model.columns):
+            df_model["visit_tag_list"] = df_model[visit_tag_col].apply(split_tags)
         
+            def tags_to_vector(tags):
+                if not tags:
+                    return np.zeros(w2v_model.vector_size, dtype=np.float32)
+                toks = [t for t in tags if t in w2v_model.wv]
+                if not toks:
+                    return np.zeros(w2v_model.vector_size, dtype=np.float32)
+                # 與備註文字相同的 IDF 字典（建議訓練時建立 tfidf_dict = {term: idf}）
+                weights = [tfidf_dict.get(t, 0.0) for t in toks]
+                if not any(w > 0 for w in weights):
+                    weights = [1.0] * len(toks)
+                vec = np.average([w2v_model.wv[t] for t in toks], axis=0, weights=weights)
+                return vec.astype(np.float32)
+        
+            df_model["w2v_tag_vector"] = df_model["visit_tag_list"].apply(tags_to_vector)
+        else:
+            df_model["visit_tag_list"] = [[] for _ in range(len(df_model))]
+            df_model["w2v_tag_vector"] = [np.zeros(w2v_model.vector_size, dtype=np.float32)
+                                         for _ in range(len(df_model))]
+        
+        # --- 依 0–7 規則做「資料列篩選」 ---
+        if strategy_id == 2:
+            # 僅保留有個人化標籤
+            df_model = df_model[df_model["personal_tags"].apply(lambda x: len(x) > 0)].reset_index(drop=True)
+        elif strategy_id == 4:
+            # 僅保留有自訂標籤
+            df_model = df_model[df_model["visit_tag_list"].apply(lambda x: len(x) > 0)].reset_index(drop=True)
+        elif strategy_id == 6:
+            # 僅保留「個人化 或 自訂」任一有填
+            has_p = df_model["personal_tags"].apply(lambda x: len(x) > 0)
+            has_v = df_model["visit_tag_list"].apply(lambda x: len(x) > 0)
+            df_model = df_model[(has_p | has_v)].reset_index(drop=True)
         elif strategy_id == 7:
-            # 個人化標籤 與 拜訪備註_標籤 都要有值
-            has_personal = df_model[['個人化標籤_背景','個人化標籤_銷售']].apply(
-                lambda r: any(len(split_tags(r.get(c))) > 0 for c in ['個人化標籤_背景','個人化標籤_銷售']),
-                axis=1
-            )
-            has_visit = df_model['拜訪備註_標籤'].apply(lambda v: len(split_tags(v)) > 0)
-            df_model = df_model[has_personal & has_visit].reset_index(drop=True)
+            # 僅保留「個人化 且 自訂」皆有填
+            has_p = df_model["personal_tags"].apply(lambda x: len(x) > 0)
+            has_v = df_model["visit_tag_list"].apply(lambda x: len(x) > 0)
+            df_model = df_model[(has_p & has_v)].reset_index(drop=True)
+        # 0/1/3/5 不做資料列過濾（全保留）
         
-        # Debug 訊息
-        print(f"[strategy {strategy_id}] merged_tags 非空筆數：{(df_model['merged_tags'].apply(len) > 0).sum()} / 總樣本數：{len(df_model)}")
+        
+        # # 篩選條件
+        # if strategy_id in [2, 4, 6]:
+        #     # 需要任一欄位非空
+        #     df_model = df_model[df_model["merged_tags"].apply(lambda x: len(x) > 0)].reset_index(drop=True)
+        
+        # elif strategy_id == 7:
+        #     # 個人化標籤 與 拜訪備註_標籤 都要有值
+        #     has_personal = df_model[['個人化標籤_背景','個人化標籤_銷售']].apply(
+        #         lambda r: any(len(split_tags(r.get(c))) > 0 for c in ['個人化標籤_背景','個人化標籤_銷售']),
+        #         axis=1
+        #     )
+        #     has_visit = df_model['拜訪備註_標籤'].apply(lambda v: len(split_tags(v)) > 0)
+        #     df_model = df_model[has_personal & has_visit].reset_index(drop=True)
+        
+        # # Debug 訊息
+        # print(f"[strategy {strategy_id}] merged_tags 非空筆數：{(df_model['merged_tags'].apply(len) > 0).sum()} / 總樣本數：{len(df_model)}")
 
         
         # --- 2. 切分 Train / Holdout ---
@@ -941,18 +1302,50 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         X_num_scaled = scale_keep_nan(df_train)
     
         # --- Word2Vec 特徵 ---
+        # w2v_vectors = df_train["w2v_vector"].to_list()
+        # X_w2v_weighted = []
+        # for vecs in w2v_vectors:
+        #     if isinstance(vecs, list) and len(vecs) > 0:
+        #         try:
+        #             weighted_vec = np.mean(vecs, axis=0)
+        #         except Exception:
+        #             weighted_vec = np.zeros(100)
+        #     else:
+        #         weighted_vec = np.zeros(100)
+        #     X_w2v_weighted.append(weighted_vec)
+        # X_w2v_weighted = np.array(X_w2v_weighted)
+        
+        w2v_dim = int(getattr(w2v_model, "vector_size", 100))
         w2v_vectors = df_train["w2v_vector"].to_list()
         X_w2v_weighted = []
-        for vecs in w2v_vectors:
-            if isinstance(vecs, list) and len(vecs) > 0:
-                try:
-                    weighted_vec = np.mean(vecs, axis=0)
-                except Exception:
-                    weighted_vec = np.zeros(100)
+        
+        for v in w2v_vectors:
+            if isinstance(v, np.ndarray):
+                if v.ndim == 1:
+                    vec = v
+                elif v.ndim == 2:
+                    vec = v.mean(axis=0)
+                else:
+                    vec = np.zeros(w2v_dim, dtype=np.float32)
+            elif isinstance(v, (list, tuple)):
+                arr = np.asarray(v, dtype=np.float32)
+                if arr.ndim == 1:
+                    vec = arr
+                elif arr.ndim == 2:
+                    vec = arr.mean(axis=0)
+                else:
+                    vec = np.zeros(w2v_dim, dtype=np.float32)
             else:
-                weighted_vec = np.zeros(100)
-            X_w2v_weighted.append(weighted_vec)
-        X_w2v_weighted = np.array(X_w2v_weighted)
+                vec = np.zeros(w2v_dim, dtype=np.float32)
+        
+            # 長度不符就 pad/trim
+            if vec.shape[0] != w2v_dim:
+                tmp = np.zeros(w2v_dim, dtype=np.float32)
+                tmp[:min(w2v_dim, vec.shape[0])] = vec[:w2v_dim]
+                vec = tmp
+            X_w2v_weighted.append(vec)
+        
+        X_w2v_weighted = np.vstack(X_w2v_weighted)
     
         # Step 4: 使用 XGBoost Feature Importance 選出 Word2Vec Top 10 維度
         X_all = np.hstack([X_w2v_weighted, X_num_scaled])
@@ -960,20 +1353,32 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         model_init = XGBClassifier(eval_metric='logloss', random_state=42)
         model_init.fit(X_all, y)
         w2v_importances = model_init.feature_importances_[:X_w2v_weighted.shape[1]]
-        top_k = 10
+        top_k = 32
         w2v_top_indices = np.argsort(w2v_importances)[::-1][:top_k]
         # X_w2v_top = X_w2v_weighted[:, w2v_top_indices]
     
         # --- 4. MultiLabelBinarizer for Tags ---
-        mlb = MultiLabelBinarizer()
-        mlb.fit(df_train["merged_tags"])
+        # mlb = MultiLabelBinarizer()
+        # mlb.fit(df_train["merged_tags"])
         
-        known_tags = set(mlb.classes_)
+        # known_tags = set(mlb.classes_)
 
-        def safe_mlb_transform(mlb, tags_series):
-            # 只保留訓練看過的標籤
-            filtered = tags_series.apply(lambda lst: [t for t in (lst or []) if t in known_tags])
-            return mlb.transform(filtered)
+        # def safe_mlb_transform(mlb, tags_series):
+        #     # 只保留訓練看過的標籤
+        #     filtered = tags_series.apply(lambda lst: [t for t in (lst or []) if t in known_tags])
+        #     return mlb.transform(filtered)
+        
+        # --- OHE for 個人化標籤 ---
+        if "personal_tags" in df_model.columns and df_model["personal_tags"].map(len).sum() > 0:
+            mlb = MultiLabelBinarizer()
+            mlb.fit(df_train["personal_tags"])
+            known_tags = set(mlb.classes_)
+        
+            def safe_mlb_transform(tags_series):
+                filtered = tags_series.apply(lambda lst: [t for t in (lst or []) if t in known_tags])
+                return mlb.transform(filtered)
+        else:
+            mlb = None
         
         # --- 5. Feature Preparation Function ---
         def prepare_features(df_subset, return_feature_names=False):
@@ -983,43 +1388,113 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
             # 數值欄位 (標準化後)
             # X_scaled = scale_keep_nan(df_subset)
             
+            # w2v_vectors = df_subset["w2v_vector"].to_list()
+            # X_w2v_weighted = []
+            # for vecs in w2v_vectors:
+            #     if isinstance(vecs, list) and len(vecs) > 0:
+            #         try:
+            #             weighted_vec = np.mean(vecs, axis=0)
+            #         except Exception:
+            #             weighted_vec = np.zeros(100)
+            #     else:
+            #         weighted_vec = np.zeros(100)
+            #     X_w2v_weighted.append(weighted_vec)
+            # X_w2v_weighted = np.array(X_w2v_weighted)
+            # X_w2v_top_subset = X_w2v_weighted[:, w2v_top_indices]
+            
+            w2v_dim = int(getattr(w2v_model, "vector_size", 100))
             w2v_vectors = df_subset["w2v_vector"].to_list()
             X_w2v_weighted = []
-            for vecs in w2v_vectors:
-                if isinstance(vecs, list) and len(vecs) > 0:
-                    try:
-                        weighted_vec = np.mean(vecs, axis=0)
-                    except Exception:
-                        weighted_vec = np.zeros(100)
+            
+            for v in w2v_vectors:
+                if isinstance(v, np.ndarray):
+                    if v.ndim == 1:
+                        vec = v
+                    elif v.ndim == 2:
+                        vec = v.mean(axis=0)
+                    else:
+                        vec = np.zeros(w2v_dim, dtype=np.float32)
+                elif isinstance(v, (list, tuple)):
+                    arr = np.asarray(v, dtype=np.float32)
+                    if arr.ndim == 1:
+                        vec = arr
+                    elif arr.ndim == 2:
+                        vec = arr.mean(axis=0)
+                    else:
+                        vec = np.zeros(w2v_dim, dtype=np.float32)
                 else:
-                    weighted_vec = np.zeros(100)
-                X_w2v_weighted.append(weighted_vec)
-            X_w2v_weighted = np.array(X_w2v_weighted)
+                    vec = np.zeros(w2v_dim, dtype=np.float32)
+            
+                if vec.shape[0] != w2v_dim:
+                    tmp = np.zeros(w2v_dim, dtype=np.float32)
+                    tmp[:min(w2v_dim, vec.shape[0])] = vec[:w2v_dim]
+                    vec = tmp
+                X_w2v_weighted.append(vec)
+            
+            X_w2v_weighted = np.vstack(X_w2v_weighted)
             X_w2v_top_subset = X_w2v_weighted[:, w2v_top_indices]
-        
-            # === 合併所有特徵 ===
-            final_features = np.hstack([X_w2v_top_subset, X_scaled])
-            final_features = final_features.astype(np.float32, copy=False)
-        
-            final_feature_names = [
-                f"w2v_{i}" for i in w2v_top_indices
-            ] + numerical_cols
             
-            # 在 prepare_features 裡使用：
-            if tag_cols:
-                tags_trans = safe_mlb_transform(mlb, df_subset["merged_tags"])
-                final_features = np.hstack([final_features, tags_trans])
-                final_feature_names += list(mlb.classes_)  # 若你有維持名稱
+                    
+            # # === 合併所有特徵 ===
+            # final_features = np.hstack([X_w2v_top_subset, X_scaled])
+            # final_features = final_features.astype(np.float32, copy=False)
+        
+            # final_feature_names = [
+            #     f"w2v_{i}" for i in w2v_top_indices
+            # ] + numerical_cols
             
+            # # 在 prepare_features 裡使用：
             # if tag_cols:
-            #     tags_trans = mlb.transform(df_subset["merged_tags"])
+            #     tags_trans = safe_mlb_transform(mlb, df_subset["merged_tags"])
             #     final_features = np.hstack([final_features, tags_trans])
-            #     final_feature_names += mlb.classes_.tolist()
+            #     final_feature_names += list(mlb.classes_)  # 若你有維持名稱
+            
+            # # if tag_cols:
+            # #     tags_trans = mlb.transform(df_subset["merged_tags"])
+            # #     final_features = np.hstack([final_features, tags_trans])
+            # #     final_feature_names += mlb.classes_.tolist()
         
+            # if return_feature_names:
+            #     return final_features, final_feature_names
+            # else:
+            #     return final_features
+            
+            # === 新增：拜訪備註_標籤向量（與備註同維度、同 top-k）===
+            w2v_dim = int(getattr(w2v_model, "vector_size", 100))
+            if "w2v_tag_vector" in df_subset.columns:
+                tag_vecs = df_subset["w2v_tag_vector"].to_list()
+                X_w2vtag = []
+                for v in tag_vecs:
+                    if isinstance(v, np.ndarray):
+                        vec = v
+                    elif isinstance(v, (list, tuple)):
+                        vec = np.asarray(v, dtype=np.float32)
+                    else:
+                        vec = np.zeros(w2v_dim, dtype=np.float32)
+                    if vec.shape[0] != w2v_dim:
+                        tmp = np.zeros(w2v_dim, dtype=np.float32)
+                        tmp[:min(w2v_dim, vec.shape[0])] = vec[:w2v_dim]
+                        vec = tmp
+                    X_w2vtag.append(vec)
+                X_w2vtag = np.vstack(X_w2vtag)
+                X_w2vtag_top = X_w2vtag[:, w2v_top_indices]  # ★ 使用同一組 top-k 維
+            else:
+                X_w2vtag_top = np.zeros((len(df_subset), len(w2v_top_indices)), dtype=np.float32)
+            
+            # --- 個人化標籤 OHE ---
+            final_features = np.hstack([X_w2v_top_subset, X_scaled, X_w2vtag_top])
+            final_feature_names = [f"w2v_{i}" for i in w2v_top_indices] + numerical_cols + [f"w2vtag_{i}" for i in w2v_top_indices]
+            
+            if mlb is not None and "personal_tags" in df_subset.columns:
+                tags_trans = safe_mlb_transform(df_subset["personal_tags"])
+                final_features = np.hstack([final_features, tags_trans])
+                final_feature_names += list(mlb.classes_)  # 直接用類別名
+            
             if return_feature_names:
                 return final_features, final_feature_names
             else:
                 return final_features
+
         
         # --- 6. Train Cross-Validation ---
         X_train_full, final_feature_names = prepare_features(df_train, return_feature_names=True)
@@ -1054,16 +1529,26 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         # --- 存模型到 models/<timestamp>/strategy_{sid}/ ---
         strategy_dir=os.path.join(models_dir, f"strategy_{strategy_id}")
         os.makedirs(strategy_dir, exist_ok=True)
-        joblib.dump(model,              os.path.join(strategy_dir,"model_final.pkl"))
-        # 若你有 w2v / tfidf 物件可一起 dump；這裡假設以「平均後向量」為主不需再存
-        # joblib.dump(scaler,             os.path.join(strategy_dir,"scaler.pkl"))
-        joblib.dump(w2v_model,    os.path.join(strategy_dir,"word2vec_model.pkl"))
+        
         # 存 feature_names（含 w2v_前綴 + 數值 +（可選）tag 名稱）
         feat_names=[f"w2v_{i}" for i in w2v_top_indices]+numerical_cols
-        if tag_cols: feat_names+=list(mlb.classes_)
-        joblib.dump(final_feature_names,         os.path.join(strategy_dir,"feature_names.pkl"))
-        # train_reference（數值特徵分佈參考）
+        # if tag_cols: feat_names+=list(mlb.classes_)
+        if (mlb is not None) and hasattr(mlb, "classes_"):
+            feat_names += list(mlb.classes_)
+        
+        # 存模型與前處理物件 ---
+        joblib.dump(model,              os.path.join(strategy_dir, "model_final.pkl"))
+        # 可選 scaler：你目前實作是 scale_keep_nan，無需 dump scaler.pkl
+        # joblib.dump(scaler,            os.path.join(strategy_dir, "scaler.pkl"))
+        joblib.dump(w2v_model,          os.path.join(strategy_dir, "word2vec_model.pkl"))
+        joblib.dump(tfidf_vectorizer,   os.path.join(strategy_dir, "tfidf_vectorizer.pkl"))
+        joblib.dump(w2v_top_indices,    os.path.join(strategy_dir, "w2v_top_indices.pkl"))
+        
+        # 存 feature_names（含 w2v_ 前綴 + 數值 +（可選）tag 名稱）
+        joblib.dump(final_feature_names, os.path.join(strategy_dir, "feature_names.pkl"))
+        # 存訓練參考分佈
         df_train[numerical_cols].to_csv(os.path.join(strategy_dir, "train_reference.csv"), index=False)
+
 
         
         
@@ -1076,12 +1561,14 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         for sid in strategy_ids:
             sd = os.path.join(models_dir, f"strategy_{sid}")
             latest_info["strategies"][str(sid)] = {
-                # 這裡用「相對於 latest.json 所在目錄」的相對路徑，predict 端會自動轉絕對
-                "model":           os.path.relpath(os.path.join(sd,"model_final.pkl"), models_dir),
-                "scaler":          os.path.relpath(os.path.join(sd,"scaler.pkl"), models_dir),
-                "features":        os.path.relpath(os.path.join(sd,"feature_names.pkl"), models_dir),
-                "w2v_top_indices": os.path.relpath(os.path.join(sd,"w2v_top_indices.pkl"), models_dir),
-                "train_reference": os.path.relpath(os.path.join(sd,"train_reference.csv"), models_dir)
+                # 以 latest.json 所在目錄為基準的相對路徑
+                "model":           os.path.relpath(os.path.join(sd, "model_final.pkl"), models_dir),
+                "word2vec":        os.path.relpath(os.path.join(sd, "word2vec_model.pkl"), models_dir),
+                "tfidf":           os.path.relpath(os.path.join(sd, "tfidf_vectorizer.pkl"), models_dir),
+                # "scaler":       （若未保存就不要寫入）
+                "features":        os.path.relpath(os.path.join(sd, "feature_names.pkl"), models_dir),
+                "w2v_top_indices": os.path.relpath(os.path.join(sd, "w2v_top_indices.pkl"), models_dir),
+                "train_reference": os.path.relpath(os.path.join(sd, "train_reference.csv"), models_dir)
             }
             
             # 寫在本次 timestamp 目錄
@@ -1126,12 +1613,16 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         
                 summary_df = plot_shap_bin_auto_with_summary_dual_x(
                     X_train_full, shap_values, final_feature_names,
-                    variables=numerical_cols,  # 可調整是否包含 tag
+                    variables=numerical_cols,
                     mean_dict = dict(zip(numerical_cols, means)), 
                     scale_dict = dict(zip(numerical_cols, stds)), 
                     output_dir=output_dir,
-                    window=20, min_range_width=0.1, merge_gap=0.05
+                    window=20, min_range_width=0.1, merge_gap=0.05,
+                    xgb_model=model,                                # ★ 傳入 XGB 模型以輸出重要性
+                    xgb_importance_types=("gain","weight"), # ★ 需要哪幾種就列哪幾種
+                    xgb_topk=30
                 )
+
                 summary_df.insert(0, "timestamp", timestamp)
                 summary_df.insert(1, "strategy_id", strategy_id)
                 
@@ -1177,6 +1668,586 @@ def train_model_pipeline_with_strategies(df_ready, policy_df=None):
         # 先保證 shap 值與 df_combined 對齊
         explainer = shap.TreeExplainer(model, feature_names=final_feature_names)
         shap_values_combined = explainer(X_combined)
+        
+        
+        # === [NEW] 單一出口：輸出個人化標籤與自訂標籤的圖表與表格 ===
+        export_personal_ohe_artifacts(
+            df_combined=df_combined,
+            shap_values_combined=shap_values_combined,
+            final_feature_names=final_feature_names,
+            mlb=mlb,
+            results_dir=results_dir,
+            strategy_id=strategy_id,
+            topn_bar=31,
+            make_beeswarm=True,
+        )
+        export_custom_tag_vector_artifacts(
+            df_combined=df_combined,
+            shap_values_combined=shap_values_combined,
+            final_feature_names=final_feature_names,
+            w2v_model=w2v_model,
+            w2v_top_indices=w2v_top_indices,
+            tfidf_dict=tfidf_dict,
+            results_dir=results_dir,
+            strategy_id=strategy_id,
+            write_global_rank=True,
+        )
+
+        
+        
+        
+        # ### PATCH START: Block-level SHAP mass for personal tags ###
+        # name2pos = {fn:i for i,fn in enumerate(final_feature_names)}
+        # # 個人化標籤一熱欄
+        # personal_cols = [c for c in (list(mlb.classes_) if ('mlb' in locals() and mlb is not None) else []) if c in name2pos]
+        # # 文字區塊（備註W2V / 自訂標籤W2V）
+        # w2v_cols    = [name2pos[f"w2v_{i}"]    for i in w2v_top_indices if f"w2v_{i}"    in name2pos]
+        # w2vtag_cols = [name2pos[f"w2vtag_{i}"] for i in w2v_top_indices if f"w2vtag_{i}" in name2pos]
+        # # 其它特徵（數值 + 其餘一熱等）
+        # other_cols = [i for i,_ in enumerate(final_feature_names) if i not in set([*w2v_cols, *w2vtag_cols, *[name2pos[c] for c in personal_cols]])]
+        
+        # phi = shap_values_combined.values  # (n, d)
+        # mass = {
+        #     "personal_tags": float(np.abs(phi[:, [name2pos[c] for c in personal_cols]]).mean()) if personal_cols else 0.0,
+        #     "remark_text":   float(np.abs(phi[:, w2v_cols]).mean())    if w2v_cols else 0.0,
+        #     "custom_tags":   float(np.abs(phi[:, w2vtag_cols]).mean()) if w2vtag_cols else 0.0,
+        #     "others":        float(np.abs(phi[:, other_cols]).mean())  if other_cols else 0.0,
+        # }
+        # blk_df = pd.DataFrame([mass]).T.reset_index().rename(columns={"index":"block",0:"mean_abs_shap"})
+        # # blk_df.to_csv(os.path.join(results_dir, f"block_shap_mass_strategy_{strategy_id}.csv"), index=False, encoding="utf-8-sig")
+        
+        # # 簡單棒圖
+        # plt.figure()
+        # plt.bar(blk_df["block"], blk_df["mean_abs_shap"])
+        # plt.xticks(rotation=10); plt.ylabel("Mean |SHAP| (log-odds)")
+        # plt.title(f"Block SHAP mass (strategy {strategy_id})")
+        # plt.tight_layout()
+        # # plt.savefig(os.path.join(results_dir, f"block_shap_mass_strategy_{strategy_id}.png"), dpi=160)
+        # # plt.close()
+        # # print("✅ 輸出：block SHAP 佔比（CSV/PNG）")
+        # ### PATCH END ###
+        
+        ### PATCH START: Personal-tags ablation (retrain without OHE tags) ###
+        from sklearn.metrics import roc_auc_score, log_loss, f1_score
+        
+        def _prepare_features_without_personal(df_subset):
+            # 復用你既有 prepare_features，但跳過個人化 OHE；保持欄位順序一致
+            X_num = df_subset[numerical_cols].copy()
+            X_scaled = scale_keep_nan(X_num)
+        
+            # 備註 W2V
+            w2v_dim = int(getattr(w2v_model, "vector_size", 100))
+            vecs = df_subset["w2v_vector"].to_list()
+            Xw = []
+            for v in vecs:
+                if isinstance(v, np.ndarray):
+                    arr = v
+                elif isinstance(v, (list, tuple)):
+                    arr = np.asarray(v, dtype=np.float32)
+                else:
+                    arr = np.zeros(w2v_dim, dtype=np.float32)
+                if arr.ndim==2: arr = arr.mean(axis=0)
+                if arr.shape[0]!=w2v_dim:
+                    tmp=np.zeros(w2v_dim, dtype=np.float32); tmp[:min(w2v_dim, arr.shape[0])] = arr[:w2v_dim]; arr=tmp
+                Xw.append(arr)
+            Xw = np.vstack(Xw)[:, w2v_top_indices] if len(Xw) else np.zeros((len(df_subset), len(w2v_top_indices)), dtype=np.float32)
+        
+            # 自訂標籤向量
+            if "w2v_tag_vector" in df_subset.columns:
+                tv = df_subset["w2v_tag_vector"].to_list()
+                Xt = []
+                for v in tv:
+                    if isinstance(v, np.ndarray):
+                        arr = v
+                    elif isinstance(v, (list, tuple)):
+                        arr = np.asarray(v, dtype=np.float32)
+                    else:
+                        arr = np.zeros(w2v_dim, dtype=np.float32)
+                    if arr.shape[0]!=w2v_dim:
+                        tmp=np.zeros(w2v_dim, dtype=np.float32); tmp[:min(w2v_dim, arr.shape[0])] = arr[:w2v_dim]; arr=tmp
+                    Xt.append(arr)
+                Xt = np.vstack(Xt)[:, w2v_top_indices] if len(Xt) else np.zeros((len(df_subset), len(w2v_top_indices)), dtype=np.float32)
+            else:
+                Xt = np.zeros((len(df_subset), len(w2v_top_indices)), dtype=np.float32)
+        
+            X_final = np.hstack([Xw, X_scaled, Xt])  # ★ 不加入個人化 OHE
+            feat_names_no_personal = [f"w2v_{i}" for i in w2v_top_indices] + numerical_cols + [f"w2vtag_{i}" for i in w2v_top_indices]
+            return X_final, feat_names_no_personal
+        
+        # 拆訓練/驗證（沿用你現有切法；若已有 df_train/df_valid 就直接用）
+        df_tr = df_train.copy()
+        df_va = df_holdout.copy() # 依你的程式選一個 holdout
+        
+        # 基線（已有）：model, final_feature_names, X_train_full 等
+        
+        # 重訓：移除個人化 OHE
+        Xtr_noP, feats_noP = _prepare_features_without_personal(df_tr)
+        ytr = df_tr['label'].values
+        from xgboost import XGBClassifier
+        model_noP = XGBClassifier(**model.get_xgb_params()) if hasattr(model, "get_xgb_params") else XGBClassifier(n_estimators=300, max_depth=5, learning_rate=0.05, subsample=0.8, colsample_bytree=0.8, reg_alpha=0.0, reg_lambda=1.0, n_jobs=4, random_state=42)
+        model_noP.fit(Xtr_noP, ytr)
+        
+        # 評估
+        def _eval(m, X, y):
+            proba = m.predict_proba(X)[:,1]
+            pred  = (proba>=0.5).astype(int)
+            return {
+                "AUC": roc_auc_score(y, proba),
+                "LogLoss": log_loss(y, proba, labels=[0,1]),
+                "F1": f1_score(y, pred)
+            }
+        
+        # valid/test
+        Xva_full = X_valid_full if 'X_valid_full' in locals() else prepare_features(df_va, return_feature_names=False)
+        yva = df_va['label'].values
+        
+        Xva_noP, _ = _prepare_features_without_personal(df_va)
+        
+        m_base = _eval(model, Xva_full, yva)
+        m_noP  = _eval(model_noP, Xva_noP, yva)
+        
+        ablation_df = pd.DataFrame([
+            {"variant":"baseline(all)", **m_base},
+            {"variant":"no_personal_tags", **m_noP},
+        ])
+        ablation_path = os.path.join(results_dir, f"ablation_personal_tags_strategy_{strategy_id}.csv")
+        ablation_df.to_csv(ablation_path, index=False, encoding="utf-8-sig")
+        print("✅ 輸出：個人化標籤 Ablation（CSV）", ablation_path)
+        
+        # 判斷是否可移除（你可調整門檻）
+        if (m_noP["AUC"] >= m_base["AUC"]-0.001) and (m_noP["LogLoss"] <= m_base["LogLoss"]+0.005):
+            print("🟢 建議：移除個人化標籤不影響或略優 → 可考慮從正式模型移除以簡化/去偏。")
+        else:
+            print("🟠 提醒：移除個人化標籤造成效能下降，保留或改進標籤品質。")
+        ### PATCH END ###
+        
+        
+        
+        # ### PATCH START: 個人化標籤 SHAP bar / beeswarm 視覺化（不需守恆分配） ###
+        # import matplotlib.pyplot as collections, random
+        
+        # name2pos = {fn:i for i,fn in enumerate(final_feature_names)}
+        # # 取個人化標籤的一熱欄（與 final_feature_names 對齊）
+        # personal_cols = [c for c in (list(mlb.classes_) if ('mlb' in locals() and mlb is not None) else []) if c in name2pos]
+        
+        # if personal_cols:
+        #     idxs = [name2pos[c] for c in personal_cols]
+        #     phi_p = shap_values_combined.values[:, idxs]  # (n_samples, n_tags)
+        
+        #     # === 指標：整體 mean|SHAP|、signed mean、出現次數、present-only mean|SHAP| ===
+        #     mean_abs_all   = np.abs(phi_p).mean(axis=0)
+        #     mean_signed_all= phi_p.mean(axis=0)
+        
+        #     present_counter = collections.Counter()
+        #     if "personal_tags" in df_combined.columns:
+        #         for lst in df_combined["personal_tags"]:
+        #             for t in (lst or []): present_counter[t] += 1
+        #     counts = np.array([present_counter.get(tag, 0) for tag in personal_cols], dtype=int)
+        #     rate   = counts / max(1, len(df_combined))
+        
+        #     present_only_meanabs = []
+        #     if "personal_tags" in df_combined.columns:
+        #         # 每個標籤只看「值=1 的列」的 mean|SHAP|
+        #         for j, tag in enumerate(personal_cols):
+        #             if counts[j] == 0:
+        #                 present_only_meanabs.append(0.0)
+        #             else:
+        #                 mask = df_combined["personal_tags"].apply(lambda lst: tag in (lst or []))
+        #                 present_only_meanabs.append(float(np.abs(phi_p[mask.values, j]).mean()) if mask.any() else 0.0)
+        #     else:
+        #         present_only_meanabs = [0.0]*len(personal_cols)
+        
+        #     # 匯出資料表
+        #     bar_df = pd.DataFrame({
+        #         "tag": personal_cols,
+        #         "mean_abs_shap_all": mean_abs_all,
+        #         "mean_shap_signed_all": mean_signed_all,
+        #         "present_count": counts,
+        #         "present_rate": rate,
+        #         "mean_abs_shap_present": present_only_meanabs
+        #     }).sort_values("mean_abs_shap_all", ascending=False).reset_index(drop=True)
+        
+        #     csv_path = os.path.join(results_dir, f"personal_tags_shap_summary_strategy_{strategy_id}.csv")
+        #     bar_df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        #     print(f"✅ 輸出：{csv_path}")
+        
+        #     # === SHAP bar（像 summary bar）：Top-N 依 mean|SHAP| ===
+        #     TOPN = 31
+        #     sub = bar_df.head(TOPN)[::-1]
+        #     plt.figure(figsize=(8, 0.35*max(6, len(sub))))
+        #     plt.barh(sub["tag"], sub["mean_abs_shap_all"])
+        #     plt.xlabel("Mean |SHAP| (log-odds)")
+        #     plt.title(f"Personal tags importance (Top {min(TOPN, len(bar_df))})")
+        #     plt.tight_layout()
+        #     plt.savefig(os.path.join(results_dir, f"personal_tags_shap_bar_top{TOPN}_strategy_{strategy_id}.png"), dpi=160)
+        #     plt.close()
+        
+        #     # # （可選）只看「值=1 的列」的 bar，先過濾低頻
+        #     # MIN_COUNT = 20
+        #     # sub2 = bar_df[bar_df["present_count"] >= MIN_COUNT].sort_values("mean_abs_shap_present", ascending=False).head(TOPN)[::-1]
+        #     # if len(sub2) > 0:
+        #     #     plt.figure(figsize=(8, 0.35*max(6, len(sub2))))
+        #     #     plt.barh(sub2["tag"], sub2["mean_abs_shap_present"])
+        #     #     plt.xlabel("Mean |SHAP| when present (log-odds)")
+        #     #     plt.title(f"Personal tags importance (present-only, Top {len(sub2)})")
+        #     #     plt.tight_layout()
+        #     #     plt.savefig(os.path.join(results_dir, f"personal_tags_shap_bar_present_top{TOPN}_strategy_{strategy_id}.png"), dpi=160)
+        #     #     plt.close()
+        
+        #     # === Beeswarm 風格散點（像 SHAP beeswarm，但只針對個人化標籤） ===
+        #     TRY_BEESWARM = True
+        #     if TRY_BEESWARM:
+        #         toklist = bar_df.head(TOPN)["tag"].tolist()
+        #         xs, ys = [], []
+        #         for yi, tag in enumerate(toklist):
+        #             j = personal_cols.index(tag)
+        #             vals = phi_p[:, j]
+        #             m = min(len(vals), 2000)  # 防太密
+        #             if len(vals) > m:
+        #                 idx_sample = np.random.choice(len(vals), size=m, replace=False)
+        #                 vals = vals[idx_sample]
+        #             xs.extend(vals.tolist())
+        #             ys.extend([yi + (random.random()-0.5)*0.6 for _ in range(len(vals))])
+        #         plt.figure(figsize=(8, 0.6*max(6, len(toklist))))
+        #         plt.scatter(xs, ys, s=6, alpha=0.6)
+        #         plt.yticks(range(len(toklist)), toklist)
+        #         plt.xlabel("SHAP value (log-odds)")
+        #         plt.title(f"Personal tags beeswarm (Top {len(toklist)})")
+        #         plt.tight_layout()
+        #         plt.savefig(os.path.join(results_dir, f"personal_tags_shap_beeswarm_top{TOPN}_strategy_{strategy_id}.png"), dpi=160)
+        #         plt.close()
+        
+        #     print("✅ 個人化標籤 SHAP bar / beeswarm 圖已完成")
+        # else:
+        #     print("ℹ️ 無個人化標籤（OHE）可視覺化；可能該策略未納入或 mlb/classes 不存在。")
+        # ### PATCH END ###
+
+        ### PATCH START: Auto-pick ALLOWED_PERSONAL_TAGS by mean|SHAP| threshold ###
+        import numpy as np, pandas as pd, os
+        from sklearn.preprocessing import MultiLabelBinarizer
+        
+        # 超參：門檻與是否在本次流程直接套用（改成 True 就會用名單重建 OHE 與後續模型）
+        PERSONAL_TAG_SHAP_THRESH = 0.005
+        APPLY_SELECTED_TAGS_NOW = False  # ← 若你想「本次就用精簡後的標籤重訓」，改 True
+        
+        name2pos = {fn:i for i,fn in enumerate(final_feature_names)}
+        # 取出個人化標籤的一熱特徵
+        personal_cols = [c for c in (list(mlb.classes_) if ('mlb' in locals() and mlb is not None) else []) if c in name2pos]
+        
+        if personal_cols:
+            idxs = [name2pos[c] for c in personal_cols]
+            phi_p = shap_values_combined.values[:, idxs]  # (n_samples, n_tags)
+            mean_abs = np.abs(phi_p).mean(axis=0)
+        
+            # 依門檻產生名單
+            ALLOWED_PERSONAL_TAGS = [tag for tag, m in zip(personal_cols, mean_abs) if m >= PERSONAL_TAG_SHAP_THRESH]
+        
+            # 存檔＆列印
+            allow_df = pd.DataFrame({"tag": personal_cols, "mean_abs_shap_all": mean_abs,
+                                     "keep": [int(t in ALLOWED_PERSONAL_TAGS) for t in personal_cols]}) \
+                       .sort_values("mean_abs_shap_all", ascending=False)
+            out_csv = os.path.join(results_dir, f"personal_tags_auto_allow_thr{str(PERSONAL_TAG_SHAP_THRESH).replace('.','_')}_strategy_{strategy_id}.csv")
+            allow_df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+            print(f"✅ 產生 ALLOWED_PERSONAL_TAGS（門檻 {PERSONAL_TAG_SHAP_THRESH}）：{ALLOWED_PERSONAL_TAGS}")
+            print(f"📄 詳細清單：{out_csv}")
+        
+            # 可選：本次流程就改用這份名單來做 OHE（保持最小侵入：只更動 OHE 部分）
+            if APPLY_SELECTED_TAGS_NOW:
+                # 1) 重建 OHE 轉換器（固定 classes，不從資料學）
+                mlb = MultiLabelBinarizer(classes=ALLOWED_PERSONAL_TAGS)
+                mlb.fit([[]])  # 固定順序
+        
+                def safe_mlb_transform(series):
+                    filt = series.apply(lambda lst: [t for t in (lst or []) if t in ALLOWED_PERSONAL_TAGS])
+                    return mlb.transform(filt)
+        
+                # 2) 對 train/valid/test 重新組特徵：只替換個人化 OHE 這一段，其餘不動
+                def _rebuild_features_with_allowed(df_subset):
+                    # 你原本 prepare_features 的數值/W2V/W2Vtag 保持不變 —— 直接沿用
+                    X_core = prepare_features(df_subset, return_feature_names=False)
+                    # 但上面那個 X_core 已經含了原本 OHE；為保持最小侵入，我們改成：
+                    #   a) 只重建「個人化 OHE」並在結尾「替換」原 OHE 欄位
+                    # 若不容易抽離原 OHE，則改法二：重寫一個「只組核心（不含 OHE）」的小版 prepare，將 OHE append 在最後。
+                    # ---- 改法二（較穩）：重作核心 + 新 OHE ----
+                    # 數值
+                    X_num = df_subset[numerical_cols].copy()
+                    X_scaled = scale_keep_nan(X_num)
+                    # 備註 W2V（你前面已修過容錯）
+                    w2v_dim = int(getattr(w2v_model, "vector_size", 100))
+                    vecs = df_subset["w2v_vector"].to_list()
+                    Xw = []
+                    for v in vecs:
+                        if isinstance(v, np.ndarray):
+                            arr = v
+                        elif isinstance(v, (list, tuple)):
+                            arr = np.asarray(v, dtype=np.float32)
+                        else:
+                            arr = np.zeros(w2v_dim, dtype=np.float32)
+                        if arr.ndim == 2: arr = arr.mean(axis=0)
+                        if arr.shape[0] != w2v_dim:
+                            tmp = np.zeros(w2v_dim, dtype=np.float32)
+                            tmp[:min(w2v_dim, arr.shape[0])] = arr[:w2v_dim]
+                            arr = tmp
+                        Xw.append(arr)
+                    Xw = np.vstack(Xw) if len(Xw) else np.zeros((len(df_subset), w2v_dim), dtype=np.float32)
+                    Xw = Xw[:, w2v_top_indices]
+        
+                    # 自訂標籤向量
+                    if "w2v_tag_vector" in df_subset.columns:
+                        tv = df_subset["w2v_tag_vector"].to_list()
+                        Xt = []
+                        for v in tv:
+                            if isinstance(v, np.ndarray):
+                                arr = v
+                            elif isinstance(v, (list, tuple)):
+                                arr = np.asarray(v, dtype=np.float32)
+                            else:
+                                arr = np.zeros(w2v_dim, dtype=np.float32)
+                            if arr.shape[0] != w2v_dim:
+                                tmp = np.zeros(w2v_dim, dtype=np.float32)
+                                tmp[:min(w2v_dim, arr.shape[0])] = arr[:w2v_dim]
+                                arr = tmp
+                            Xt.append(arr)
+                        Xt = np.vstack(Xt) if len(Xt) else np.zeros((len(df_subset), w2v_dim), dtype=np.float32)
+                        Xt = Xt[:, w2v_top_indices]
+                    else:
+                        Xt = np.zeros((len(df_subset), len(w2v_top_indices)), dtype=np.float32)
+        
+                    # 新 OHE
+                    if "personal_tags" in df_subset.columns and ALLOWED_PERSONAL_TAGS:
+                        X_ohe = safe_mlb_transform(df_subset["personal_tags"])
+                        ohe_names = ALLOWED_PERSONAL_TAGS[:]
+                    else:
+                        X_ohe = np.zeros((len(df_subset), 0), dtype=np.float32)
+                        ohe_names = []
+        
+                    X_final_new = np.hstack([Xw, X_scaled, Xt, X_ohe])
+                    feat_names_new = [f"w2v_{i}" for i in w2v_top_indices] + numerical_cols + [f"w2vtag_{i}" for i in w2v_top_indices] + ohe_names
+                    return X_final_new, feat_names_new
+        
+                # 3) 用新特徵重訓（保持你原來的模型參數）
+                from xgboost import XGBClassifier
+                X_train_new, feat_names_new = _rebuild_features_with_allowed(df_train)
+                y_train = df_train['label'].values
+                if hasattr(model, "get_xgb_params"):
+                    params = model.get_xgb_params()
+                    # 小建議：對 OHE 加一點 L1 收縮
+                    # params.update({"reg_alpha": max(0.0, params.get("reg_alpha", 0.0)) + 0.1})
+                    model_new = XGBClassifier(**params)
+                else:
+                    from xgboost import XGBClassifier
+                    model_new = XGBClassifier(
+                        n_estimators=300, max_depth=5, learning_rate=0.05,
+                        subsample=0.8, colsample_bytree=0.8, reg_alpha=0.1,
+                        reg_lambda=1.0, n_jobs=4, random_state=42
+                    )
+                model_new.fit(X_train_new, y_train)
+                pr_scores, roc_scores = [], []
+                
+                # 4) 覆寫訓練中後續需要用到的物件（讓 SHAP 與輸出都用新模型）
+                model = model_new
+                final_feature_names = feat_names_new
+        
+                # 5) （可選）把名單寫進 latest.json，供預測端一致化
+                # latest_info["strategies"][str(strategy_id)]["personal_classes"] = ALLOWED_PERSONAL_TAGS
+                # 記得在你的「存 latest.json」區塊加上這行
+        else:
+            ALLOWED_PERSONAL_TAGS = []
+            print("ℹ️ 找不到個人化標籤 OHE 欄位，略過自動產生。")
+        ### PATCH END ###
+
+        
+                
+        
+        
+        # === 新增：詞級近似貢獻（對 df_combined 全部，串流輸出）===
+        try:
+            w2v_idx = np.array(w2v_top_indices, dtype=int)
+            w2v_mask = [str(n).upper().startswith("W2V_") for n in final_feature_names]
+            # shap.Explanation 取值
+            phi_w2v_all = shap_values_combined.values[:, np.where(w2v_mask)[0]]  # (n, k)
+            out_csv = os.path.join(results_dir, f"token_attribution_top10_strategy_{strategy_id}.csv")
+            if os.path.exists(out_csv):
+                os.remove(out_csv)
+        
+            import csv as _csv
+            with open(out_csv, "w", encoding="utf-8-sig", newline="") as fw:
+                writer = _csv.writer(fw)
+                writer.writerow(["timestamp","strategy_id","客戶UUID","拜訪紀錄UUID","token","token_contrib","pred_prob","label"])
+                for row_i, phi in enumerate(phi_w2v_all):
+                    text = df_combined.at[df_combined.index[row_i], "備註文字_處理"] if "備註文字_處理" in df_combined.columns else None
+                    weights = df_combined.at[df_combined.index[row_i], "tfidf_weights"] if "tfidf_weights" in df_combined.columns else None
+                    if pd.isna(text) or not text: 
+                        continue
+                    tokens = str(text).split()
+                    if not isinstance(weights, (list, np.ndarray)) or len(weights) != len(tokens):
+                        # 權重對不上就給均權
+                        weights = np.ones(len(tokens), dtype="float32")
+                    denom = float(np.sum(weights)) or 1.0
+        
+                    contribs = []
+                    for t, a in zip(tokens, weights):
+                        if t in w2v_model.wv:
+                            e = w2v_model.wv[t][w2v_idx]
+                            score = (a / denom) * float(np.dot(e, phi))
+                            contribs.append((t, score))
+                    if contribs:
+                        # 取前 10 名（依貢獻絕對值）
+                        contribs.sort(key=lambda x: abs(x[1]), reverse=True)
+                        top10 = contribs[:10]
+                        _ts = df_combined.at[df_combined.index[row_i], "timestamp"] if "timestamp" in df_combined.columns else timestamp
+                        _uuid = df_combined.at[df_combined.index[row_i], "客戶UUID"] if "客戶UUID" in df_combined.columns else None
+                        _vid  = df_combined.at[df_combined.index[row_i], "拜訪紀錄UUID"] if "拜訪紀錄UUID" in df_combined.columns else None
+                        _pp   = df_combined.at[df_combined.index[row_i], "pred_prob"] if "pred_prob" in df_combined.columns else None
+                        _lbl  = df_combined.at[df_combined.index[row_i], "label"] if "label" in df_combined.columns else None
+                        for t, s in top10:
+                            writer.writerow([_ts, strategy_id, _uuid, _vid, t, s, _pp, _lbl])
+        
+            print(f"✅ 詞級貢獻已輸出：{out_csv}")
+        except Exception as e:
+            print(f"⚠️ 詞級貢獻輸出失敗：{e}")
+            
+        # # === PATCH START: 個人化標籤 SHAP → 機率影響、以及 自訂標籤向量 → 文字貢獻 ===
+        # import collections
+        
+        # # 建一個 feature name → 位置的索引
+        # name2pos = {fn: i for i, fn in enumerate(final_feature_names)}
+        
+        # # 1) 個人化標籤（OHE）→ SHAP 直讀，再換算成機率近似 Δp
+        # try:
+        #     personal_classes = list(mlb.classes_) if ('mlb' in locals() and mlb is not None) else []
+        #     personal_cols    = [c for c in personal_classes if c in name2pos]
+        #     if personal_cols:
+        #         idxs = [name2pos[c] for c in personal_cols]
+        #         phi_personal = shap_values_combined.values[:, idxs]  # (n, n_tags)
+        
+        #         out_csv = os.path.join(results_dir, f"personal_tags_contrib_strategy_{strategy_id}.csv")
+        #         with open(out_csv, "w", encoding="utf-8-sig", newline="") as fw:
+        #             w = csv.writer(fw)
+        #             w.writerow(["timestamp","strategy_id","客戶UUID","拜訪紀錄UUID","tag",
+        #                         "shap_logodds","approx_dp","pred_prob","label"])
+        #             for r in range(phi_personal.shape[0]):
+        #                 p = df_combined.iloc[r].get("pred_prob", None)
+        #                 for tag, j in zip(personal_cols, idxs):
+        #                     shap_val = float(shap_values_combined.values[r, j])  # log-odds 尺度
+        #                     dp = (float(p)*(1.0-float(p))*shap_val) if (p is not None) else ""
+        #                     w.writerow([
+        #                         df_combined.iloc[r].get("timestamp", timestamp),
+        #                         strategy_id,
+        #                         df_combined.iloc[r].get("客戶UUID", None),
+        #                         df_combined.iloc[r].get("拜訪紀錄UUID", None),
+        #                         tag,
+        #                         f"{shap_val:.8g}",
+        #                         f"{dp:.8g}" if dp != "" else "",
+        #                         p if p is not None else "",
+        #                         df_combined.iloc[r].get("label", "")
+        #                     ])
+        #         print(f"✅ 個人化標籤影響已輸出：{out_csv}")
+        
+        #         # 全域：個人化標籤重要性（平均絕對 SHAP）
+        #         imp = (abs(phi_personal)).mean(axis=0)
+        #         pd.DataFrame({"tag": personal_cols, "mean_abs_shap": imp}).sort_values(
+        #             "mean_abs_shap", ascending=False
+        #         ).to_csv(os.path.join(results_dir, f"personal_tags_importance_strategy_{strategy_id}.csv"),
+        #                  index=False, encoding="utf-8-sig")
+        #     else:
+        #         print("ℹ️ 無個人化標籤特徵可解釋（可能 strategy=0/3/4）。")
+        # except Exception as e:
+        #     print(f"⚠️ 個人化標籤影響輸出失敗：{e}")
+        
+        # # 2) 自訂標籤向量（w2vtag_*）→ 回推到 #標籤文字的貢獻
+        # try:
+        #     # 找出 w2vtag_* 欄位，注意我們在 prepare_features 中是按 w2v_top_indices 的順序命名
+        #     w2vtag_cols = [name2pos[f"w2vtag_{i}"] for i in w2v_top_indices if f"w2vtag_{i}" in name2pos]
+        #     if w2vtag_cols:
+        #         phi_tag = shap_values_combined.values[:, w2vtag_cols]  # (n, k) 對應同一組 top 維
+        #         out_csv = os.path.join(results_dir, f"custom_tags_contrib_strategy_{strategy_id}.csv")
+        #         with open(out_csv, "w", encoding="utf-8-sig", newline="") as fw:
+        #             w = csv.writer(fw)
+        #             w.writerow(["timestamp","strategy_id","客戶UUID","拜訪紀錄UUID","token",
+        #                         "token_contrib","token_contrib_pct","approx_dp","pred_prob","label"])
+        
+        #             # 準備 IDF 查表（訓練時你應該已有 tfidf_dict，如果沒有可這樣建）
+        #             if 'tfidf_dict' in locals():
+        #                 idf_lookup = tfidf_dict
+        #             else:
+        #                 try:
+        #                     vocab = tfidf_vectorizer.get_feature_names_out()
+        #                     idfs  = tfidf_vectorizer.idf_
+        #                     idf_lookup = {t: float(i) for t, i in zip(vocab, idfs)}
+        #                 except Exception:
+        #                     idf_lookup = {}
+        
+        #             top_idx = np.asarray(w2v_top_indices, dtype=int)
+        #             for r in range(df_combined.shape[0]):
+        #                 tags = df_combined.iloc[r].get("visit_tag_list", [])
+        #                 if not tags:
+        #                     continue
+        #                 toks = [t for t in tags if t in w2v_model.wv]
+        #                 if not toks:
+        #                     continue
+        #                 ws = [idf_lookup.get(t, 0.0) for t in toks]
+        #                 if not any(x > 0 for x in ws):
+        #                     ws = [1.0]*len(toks)
+        #                 denom = float(sum(ws))
+        #                 # alignment 公式
+        #                 contribs = []
+        #                 for t, a in zip(toks, ws):
+        #                     e = w2v_model.wv[t][top_idx]
+        #                     s = (a/denom) * float(np.dot(e, phi_tag[r]))
+        #                     contribs.append((t, s))
+        #                 if not contribs:
+        #                     continue
+        #                 # 排序與百分比分攤
+        #                 contribs.sort(key=lambda x: abs(x[1]), reverse=True)
+        #                 abs_sum = sum(abs(s) for _, s in contribs) or 1.0
+        #                 p  = df_combined.iloc[r].get("pred_prob", None)
+        #                 for t, s in contribs:  # 你也可以只寫前 N 名，例如 contribs[:10]
+        #                     pct = abs(s)/abs_sum
+        #                     dp  = (float(p)*(1.0-float(p))*s) if (p is not None) else ""
+        #                     w.writerow([
+        #                         df_combined.iloc[r].get("timestamp", timestamp),
+        #                         strategy_id,
+        #                         df_combined.iloc[r].get("客戶UUID", None),
+        #                         df_combined.iloc[r].get("拜訪紀錄UUID", None),
+        #                         t,
+        #                         f"{s:.8g}",
+        #                         f"{pct:.6f}",
+        #                         f"{dp:.8g}" if dp != "" else "",
+        #                         p if p is not None else "",
+        #                         df_combined.iloc[r].get("label", "")
+        #                     ])
+        #         print(f"✅ 自訂標籤（向量）→ 文字貢獻 已輸出：{out_csv}")
+        
+        #         # 全域：彙總每個 #標籤的平均絕對貢獻（方便做排行榜/監控）
+        #         # 讀剛剛輸出的檔做 groupby（避免佔 RAM）
+        #         tag_aggr = collections.Counter()
+        #         cnt_aggr = collections.Counter()
+        #         with open(out_csv, "r", encoding="utf-8-sig") as fr:
+        #             next(fr)  # skip header
+        #             for line in fr:
+        #                 parts = line.rstrip("\n").split(",")
+        #                 # 欄位順序：... , token, token_contrib, token_contrib_pct, approx_dp, ...
+        #                 if len(parts) >= 6:
+        #                     tok = parts[4]
+        #                     try:
+        #                         val = float(parts[5])
+        #                     except:
+        #                         val = 0.0
+        #                     tag_aggr[tok] += abs(val)
+        #                     cnt_aggr[tok] += 1
+        #         rows = [{"token": k, "mean_abs_contrib": (tag_aggr[k]/max(1,cnt_aggr[k])), "count": cnt_aggr[k]}
+        #                 for k in tag_aggr]
+        #         pd.DataFrame(rows).sort_values("mean_abs_contrib", ascending=False)\
+        #           .to_csv(os.path.join(results_dir, f"visit_custom_tags_token_importance_strategy_{strategy_id}.csv"),
+        #                   index=False, encoding="utf-8-sig")
+        #     else:
+        #         print("ℹ️ 找不到 w2vtag_* 特徵（可能 strategy 沒納入自訂標籤向量）。")
+        # except Exception as e:
+        #     print(f"⚠️ 自訂標籤向量→文字貢獻 輸出失敗：{e}")
+        
+        # # === PATCH END ===
+
         
         # heatmap_shap_long = build_tableau_long(
         #     df_combined=df_combined,

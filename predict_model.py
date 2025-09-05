@@ -48,13 +48,22 @@ def load_models(models_root="D:/備註文字探勘/models", strategy_id=0):
     model   = joblib.load(_abs(e["model"]))
     w2v = joblib.load(_abs(e["word2vec"]))
     tfidf   = joblib.load(_abs(e["tfidf"]))
-    scaler  = joblib.load(_abs(e["scaler"]))
+    # scaler  = joblib.load(_abs(e["scaler"]))
+    feats   = joblib.load(_abs(e["features"]))
+    
+    scaler  = None
+    if "scaler" in e:
+        try:
+            scaler = joblib.load(_abs(e["scaler"]))
+        except Exception:
+            scaler = None
+    
     feats   = joblib.load(_abs(e["features"]))
     
     w2v_idx = None
-    if "w2v_top_indices" in e and os.path.exists(e["w2v_top_indices"]):
+    if "w2v_top_indices" in e:
         try:
-            w2v_idx = joblib.load(e["w2v_top_indices"])
+            w2v_idx = joblib.load(_abs(e["w2v_top_indices"]))
         except Exception:
             w2v_idx = None
     
@@ -169,7 +178,8 @@ def predict_with_strategy(df_ready, strategy_id, models_root):
 
     # 數值
     X_num = df_ready[num_feats].fillna(0) if num_feats else pd.DataFrame(index=df_ready.index)
-    X_scaled = scaler.transform(X_num) if not X_num.empty else np.zeros((len(df_ready), 0))
+    # X_scaled = scaler.transform(X_num) if not X_num.empty else np.zeros((len(df_ready), 0))
+    X_scaled = scaler.transform(X_num) if (scaler is not None and not X_num.empty) else (X_num.values if not X_num.empty else np.zeros((len(df_ready), 0)))
 
     # 文字向量
     tfidf_dict = dict(zip(tfidf.get_feature_names_out(), tfidf.idf_))
@@ -185,16 +195,47 @@ def predict_with_strategy(df_ready, strategy_id, models_root):
     X_w2v = w2v_all[:, top_idx] if top_idx is not None else w2v_all[:, :top_k]
 
     # 標籤類
-    if tag_feats:
-        merged = df_ready.apply(_merge_tags_row, axis=1)
-        tag_idx = {t: i for i, t in enumerate(tag_feats)}
-        X_tags = np.zeros((len(df_ready), len(tag_feats)))
-        for r, tags in enumerate(merged):
-            for t in tags:
-                if t in tag_idx:
-                    X_tags[r, tag_idx[t]] = 1.0
+    def split_tags(val):
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            return []
+        if isinstance(val, (list, tuple)):
+            s = ",".join(map(str, val))
+        else:
+            s = str(val)
+        s = (s.replace("，", ",").replace("、", ",")
+               .replace("  ", " ").replace(" ,", ","))
+        toks = [p.strip().strip(".").strip("🖊️").strip("#").lower()
+                for p in s.split(",")]
+        return [t for t in toks if t]
+    
+    # 拜訪備註_標籤 → 向量
+    if "拜訪備註_標籤" in df_ready.columns:
+        df_ready["visit_tag_list"] = df_ready["拜訪備註_標籤"].apply(split_tags)
+        idf = dict(zip(tfidf.get_feature_names_out(), tfidf.idf_))
+        def tags_to_vector(tags):
+            if not tags: 
+                return np.zeros(w2v_model.vector_size, dtype=np.float32)
+            toks = [t for t in tags if t in w2v_model.wv]
+            if not toks:
+                return np.zeros(w2v_model.vector_size, dtype=np.float32)
+            w = [idf.get(t, 0.0) for t in toks]
+            if not any(x > 0 for x in w):
+                w = [1.0] * len(toks)
+            return np.average([w2v_model.wv[t] for t in toks], axis=0, weights=w).astype(np.float32)
+        df_ready["w2v_tag_vector"] = df_ready["visit_tag_list"].apply(tags_to_vector)
     else:
-        X_tags = np.zeros((len(df_ready), 0))
+        df_ready["w2v_tag_vector"] = [np.zeros(w2v_model.vector_size, dtype=np.float32) for _ in range(len(df_ready))]
+    
+    # if tag_feats:
+    #     merged = df_ready.apply(_merge_tags_row, axis=1)
+    #     tag_idx = {t: i for i, t in enumerate(tag_feats)}
+    #     X_tags = np.zeros((len(df_ready), len(tag_feats)))
+    #     for r, tags in enumerate(merged):
+    #         for t in tags:
+    #             if t in tag_idx:
+    #                 X_tags[r, tag_idx[t]] = 1.0
+    # else:
+    #     X_tags = np.zeros((len(df_ready), 0))
 
     X_final = np.hstack([X_w2v, X_scaled, X_tags])
     y_prob = model.predict_proba(X_final)[:, 1]
@@ -207,7 +248,7 @@ def predict_with_strategy(df_ready, strategy_id, models_root):
     df_out["strategy_id"] = strategy_id
     return df_out
 
-def predict_batch(df_ready, output_path, strategy_ids=[0, 5, 6], models_root="D:/備註文字探勘/models", policy_path=None):
+def predict_batch(df_ready, output_path, strategy_ids=[0, 2, 6], models_root="D:/備註文字探勘/models", policy_path=None):
     all_results = []
     for sid in strategy_ids:
         try:

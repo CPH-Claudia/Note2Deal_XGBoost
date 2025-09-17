@@ -101,6 +101,16 @@ def full_pipeline_with_ckip(file_path):
             "https://raw.githubusercontent.com/goto456/stopwords/master/hit_stopwords.txt",
             "https://raw.githubusercontent.com/goto456/stopwords/master/scu_stopwords.txt"
         ]
+        
+        # === 新增：停用詞本地快取，避免每次下載 ===
+        cache_path = os.path.join(os.path.dirname(__file__), "stopwords_trad.txt")
+        stopwords_trad = set()
+        if os.path.exists(cache_path):
+            print(f"📦 使用本地快取停用詞：{cache_path}")
+            with open(cache_path, "r", encoding="utf-8") as f:
+                stopwords_trad = set(w.strip() for w in f if w.strip())
+        else:
+            print("⏬ 首次建立停用詞快取（簡→繁轉換）…")
     
         # 初始化簡體轉繁體轉換器
         cc = OpenCC('s2t')  # Simplified to Traditional
@@ -121,6 +131,14 @@ def full_pipeline_with_ckip(file_path):
                         stopwords_trad.add(word)
     
         print(f"共獲得停用詞數量（繁體）: {len(stopwords_trad)}")
+        
+        # 寫回本地快取
+        try:
+            with open(cache_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(sorted(stopwords_trad)))
+            print(f"✅ 停用詞已快取到：{cache_path}")
+        except Exception as e:
+            print(f"⚠️ 停用詞快取失敗：{e}")
     
         # filtered_words = [
         #     [word for word in sentence if word not in stopwords_trad and len(word) > 1]
@@ -181,7 +199,7 @@ def full_pipeline_with_ckip(file_path):
     
         if not safe_to_predict:
             print("⚠️ 偵測到資料偏移，正在重新訓練模型...")
-            from retrain_model_label import train_model_pipeline_with_strategies
+            from retrain_model_label_changed import train_model_pipeline_with_strategies
             train_model_pipeline_with_strategies(df_ready, policy_df)
             return df_ready, policy_df  # retrain 中已處理預測與輸出，這裡直接結束流程
     

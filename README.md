@@ -69,7 +69,7 @@
 
 快速執行：
 ```bash
-python full_pipeline_with_ckip.py
+python39 D:\備註文字探勘\repeater\full_pipeline_with_ckip.py
 Please enter the full path to the new Excel data file:
 D:\備註文字探勘\repeater\新資料_0731.xlsx
 

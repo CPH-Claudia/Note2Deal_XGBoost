@@ -67,35 +67,6 @@
 
 ---
 
-## 🧪 輸出內容
-
-每次執行預測流程後將匯出：
-
-- `預測_<timestamp>.xlsx`
-  - Sheet1: 模型預測結果（含 UUID、預測機率）
-  - Sheet2: WordCloud 特徵統計
-  - Sheet3: SHAP 正向貢獻區間
-  - Sheet4: 拜訪備註的詞語斷詞長格式
-
----
-
-## 🧰 主要依賴套件
-
-- `pandas`, `numpy`
-- `xgboost`, `scikit-learn`
-- `joblib`, `openpyxl`, `xlsxwriter`
-- `gensim`（Word2Vec）
-- `CKIPTagger`（中文斷詞）
-- `shap`
-- `matplotlib`, `seaborn`
-
-快速執行：
-```bash
-python39 D:\備註文字探勘\repeater\full_pipeline_with_ckip.py
-Please enter the full path to the new Excel data file:
-D:\備註文字探勘\repeater\新資料_0731.xlsx
-```
-
 # 🧪 時間外驗證（OOT Validation）
 
 ## 為什麼另外做 OOT？

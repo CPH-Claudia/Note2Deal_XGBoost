@@ -96,35 +96,46 @@ Please enter the full path to the new Excel data file:
 D:\備註文字探勘\repeater\新資料_0731.xlsx
 ```
 
+# 🧪 時間外驗證（OOT Validation）
 
-時間外驗證（OOT Validation）
-為什麼另外做 OOT？
+## 為什麼另外做 OOT？
 
 模型開發階段原先使用 random holdout / cross-validation 評估模型。
 
 但隨機切分的 train / test 仍來自相近的歷史期間，因此無法完全回答：
 
-模型建立完成後，遇到真正較晚的新資料是否仍然有效？
+> **模型建立完成後，遇到真正較晚的新資料是否仍然有效？**
 
-因此額外進行 Out-of-Time Validation。
+因此額外進行 **Out-of-Time Validation**。
 
-OOT 驗證設計
+---
+
+## OOT 驗證設計
 
 本次使用：
 
+```text
 Model version：
 20251031_193703 / Strategy 0
-資料時間切割
-資料	時間
-訓練拜訪資料	2024/03/27 ～ 2025/09/25
-訓練保單資料	2024/04/27 ～ 2025/10/25
-模型建立	2025/10/31
-OOT 拜訪資料	2025/11/01 ～ 2025/12/31
-保單 outcome 觀察截止	2026/06/30
+```
+
+### 資料時間切割
+
+| 資料              | 時間                      |
+| --------------- | ----------------------- |
+| 訓練拜訪資料          | 2024/03/27 ～ 2025/09/25 |
+| 訓練保單資料          | 2024/04/27 ～ 2025/10/25 |
+| 模型建立            | 2025/10/31              |
+| OOT 拜訪資料        | 2025/11/01 ～ 2025/12/31 |
+| 保單 outcome 觀察截止 | 2026/06/30              |
 
 OOT 拜訪全部發生於模型建立之後，未參與模型訓練。
 
-OOT 驗證流程
+---
+
+## OOT 驗證流程
+
+```text
 Historical Data
 2024/03 ～ 2025/09
         ↓
@@ -147,128 +158,234 @@ through 2026/06/30
         ↓
 Compare Prediction
 with Actual Outcome
-驗證原則
+```
+
+### 驗證原則
 
 OOT 階段：
 
-不重新訓練 XGBoost
-不重新訓練 Word2Vec
-不重新 fit TF-IDF
-沿用原模型 feature schema
-沿用原模型營業單位 mapping
-使用相同的 86 個模型特徵
+* 不重新訓練 XGBoost
+* 不重新訓練 Word2Vec
+* 不重新 fit TF-IDF
+* 沿用原模型 feature schema
+* 沿用原模型營業單位 mapping
+* 使用相同的 86 個模型特徵
 
 執行時確認：
 
+```text
 model.n_features_in_ : 86
 feature_names.pkl    : 86
 X_oot                : 86
+```
 
 三者一致後才進行預測。
 
-📊 OOT 驗證結果
+---
+
+# 📊 OOT 驗證結果
 
 OOT 共包含：
 
+```text
 Sample Size    : 2,692
 Positive Count : 1,228
 Base Rate      : 45.62%
+```
 
 主要模型指標：
 
-Metric	Result
-ROC-AUC	0.792
-PR-AUC	0.782
-Brier Score	0.187
-Mean Predicted Probability	41.75%
-高分拜訪的實際有效率
-Model Ranking	N	Observed Positive Rate	Lift
-Overall	2,692	45.62%	1.00
-Top 20%	539	85.71%	1.88×
-Top 10%	270	92.59%	2.03×
-Top 5%	135	94.07%	2.06×
-OOT 結果解讀
+| Metric                     |    Result |
+| -------------------------- | --------: |
+| ROC-AUC                    | **0.792** |
+| PR-AUC                     | **0.782** |
+| Brier Score                | **0.187** |
+| Mean Predicted Probability |    41.75% |
+
+### 高分拜訪的實際有效率
+
+| Model Ranking |     N | Observed Positive Rate |      Lift |
+| ------------- | ----: | ---------------------: | --------: |
+| Overall       | 2,692 |                 45.62% |      1.00 |
+| Top 20%       |   539 |             **85.71%** | **1.88×** |
+| Top 10%       |   270 |             **92.59%** | **2.03×** |
+| Top 5%        |   135 |             **94.07%** | **2.06×** |
+
+---
+
+## OOT 結果解讀
 
 全部時間外拜訪中，約：
 
+```text
 45.6%
+```
 
 符合有效拜訪定義。
 
 但依模型預測分數排序後：
 
+```text
 Top 10% → 92.6%
+```
 
 的拜訪符合有效拜訪定義。
 
 因此：
 
+```text
 Lift@10% = 2.03
+```
 
-表示前 10% 高分拜訪的有效率，約為全部拜訪平均的 2.03 倍。
+表示前 10% 高分拜訪的有效率，約為全部拜訪平均的 **2.03 倍**。
 
 ROC-AUC 約 0.79、PR-AUC 約 0.78，也顯示模型在模型建立後的新資料中仍具有良好的 discrimination / ranking ability。
 
-OOT 結論
+### OOT 結論
 
-Strategy 0 在未參與模型訓練、且發生於模型建立後的新時間區段中，仍能有效將較可能與成交相關的拜訪集中於高分區。
+> Strategy 0 在未參與模型訓練、且發生於模型建立後的新時間區段中，仍能有效將較可能與成交相關的拜訪集中於高分區。
 
 因此目前模型較適合定位為：
 
+```text
 High-potential Visit Ranking Model
+```
 
 而非：
 
+```text
 Exact Conversion Probability
 or
 Causal Conversion Model
-⚠️ 模型限制與後續改善
+```
+
+---
+
+# ⚠️ 模型限制與後續改善
 
 本次 OOT 已將模型訓練期間與驗證拜訪期間分開，但原始 feature engineering 中仍有部分歷史統計特徵可能使用完整資料期間計算，例如：
 
-平均每客戶拜訪次數
-平均拜訪間隔天數
-每週平均拜訪客戶數
-距離最近晉升天數
+* 平均每客戶拜訪次數
+* 平均拜訪間隔天數
+* 每週平均拜訪客戶數
+* 距離最近晉升天數
 
-因此目前結果支持模型具有 時間外排序能力，但若要正式投入 production，下一版建議將所有 predictor 改為嚴格的：
+因此目前結果支持模型具有 **時間外排序能力**，但若要正式投入 production，下一版建議將所有 predictor 改為嚴格的：
 
+```text
 Point-in-Time Features
+```
 
 即每筆拜訪只能使用該次拜訪發生當下以前已知的資訊。
 
 其他可改善方向：
 
-建立完整 point-in-time feature pipeline
-加入 feature schema validation
-保存所有 Encoder / Transformer
-Rolling temporal validation
-Model / data drift monitoring
-Calibration analysis
-不同 outcome window（30 / 90 / 180 days）Sensitivity Analysis
-📁 輸出內容
-一般模型預測
+* 建立完整 point-in-time feature pipeline
+* 加入 feature schema validation
+* 保存所有 Encoder / Transformer
+* Rolling temporal validation
+* Model / data drift monitoring
+* Calibration analysis
+* 不同 outcome window（30 / 90 / 180 days）Sensitivity Analysis
+
+---
+
+# 📁 輸出內容
+
+## 一般模型預測
 
 每次執行預測流程後輸出：
 
+```text
 預測_<timestamp>.xlsx
+```
 
 內容包含：
 
-模型預測結果與 UUID
-預測機率
-WordCloud 特徵統計
-SHAP 正向貢獻區間
-拜訪備註斷詞長格式
-OOT Validation
+* 模型預測結果與 UUID
+* 預測機率
+* WordCloud 特徵統計
+* SHAP 正向貢獻區間
+* 拜訪備註斷詞長格式
+
+## OOT Validation
 
 時間外驗證輸出：
 
+```text
 oot_validation_20251031_193703_strategy0.xlsx
+```
 
 主要包含：
 
-metrics：ROC-AUC、PR-AUC、Brier Score、Lift
-deciles：依模型分數分群後的實際有效率
-detail：每筆拜訪的 prediction / actual label
+* `metrics`：ROC-AUC、PR-AUC、Brier Score、Lift
+* `deciles`：依模型分數分群後的實際有效率
+* `detail`：每筆拜訪的 prediction / actual label
 
+---
+
+# 🧰 Tech Stack
+
+### Data Processing
+
+* Python
+* pandas
+* numpy
+
+### Machine Learning
+
+* XGBoost
+* scikit-learn
+* SHAP
+
+### NLP
+
+* CKIPTagger
+* Word2Vec
+* TF-IDF
+* gensim
+
+### Model / Output
+
+* joblib
+* openpyxl
+* xlsxwriter
+
+### Version Control
+
+* Git
+* GitHub
+
+---
+
+# 🚀 Quick Start
+
+## 完整預測流程
+
+```bash
+python39 D:\備註文字探勘\repeater\full_pipeline_with_ckip.py
+```
+
+輸入新的 Excel 資料：
+
+```text
+Please enter the full path to the new Excel data file:
+D:\備註文字探勘\repeater\新資料_0731.xlsx
+```
+
+## Strategy 0 OOT Validation
+
+```bash
+python39 D:\備註文字探勘\model_validation\validate_oot_20251031_strategy0.py
+```
+
+成功執行時確認：
+
+```text
+✅ OOT 特徵完成
+模型 n_features_in_：86
+feature_names.pkl：86
+本次 X_oot：86
+✅ OOT 預測完成
+✅ OOT 驗證報告輸出完成
+```
